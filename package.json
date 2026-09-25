@@ -1,0 +1,29 @@
+{
+  "name": "agent-talk-mcp",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "description": "Local native conversation bridge for Codex, Claude Desktop and DSH Web",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "check": "node --check src/server.mjs && node --check src/adapters.mjs && node --check src/store.mjs && node --check src/delivery.mjs && node --check src/dsh-events.mjs && node --check src/dsh-auth.mjs && node --check src/dsh-auth-plugin.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "connect:dsh": "node scripts/connect-dsh.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "3.25.76"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YanZiBin/agent-talk-mcp.git"
+  },
+  "homepage": "https://github.com/YanZiBin/agent-talk-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/YanZiBin/agent-talk-mcp/issues"
+  }
+}

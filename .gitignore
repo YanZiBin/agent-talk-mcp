@@ -1,0 +1,13 @@
+node_modules/
+work/
+.local/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+dsh-auth.json
+dsh-login.json
+dsh-login-url.txt
