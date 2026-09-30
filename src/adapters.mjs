@@ -104,7 +104,7 @@ export async function listSessions(app, cwd) {
   let rows;
   if (app === 'claude') rows = (await claudeSessions()).map(s => {
     const meta = JSON.parse(fs.readFileSync(path.join(home, '.claude/sessions', `${s.pid}.json`), 'utf8'));
-    if (meta.entrypoint !== 'claude-desktop') return null;
+    if (!['claude-desktop', 'cli'].includes(meta.entrypoint)) return null;
     return { sessionId: s.sessionId, cwd: s.cwd, title: s.name, status: meta.status, nativeId: meta.hostSessionId };
   }).filter(Boolean);
   else if (app === 'codex') rows = codexRows().map(({ rollout_path, ...r }) => ({ ...r, status: 'unknown' }));
@@ -148,7 +148,7 @@ export async function readSession(target) {
   let file, status = 'unknown', pauseKey = null;
   if (target.app === 'claude') {
     const row = (await listSessions('claude')).find(s => s.sessionId === target.sessionId);
-    if (!row) throw Error('此 Claude 对话未在桌面端运行');
+    if (!row) throw Error('此 Claude 对话未在运行（桌面端或终端）');
     if (canonical(row.cwd) !== target.cwd) throw Error('对话目录已发生变化');
     status = row.status;
     const root = path.join(home, '.claude/projects');
