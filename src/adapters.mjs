@@ -37,18 +37,18 @@ function codexRows(sessionId) {
 
 export async function dshCall(method, request = {}, namedArgs) {
   let { baseUrl, cookie } = await ensureDshAuth();
-  const rpcId = randomUUID();
+  const rpcId = randomUUID(), readOnly = ['session/list', 'session/page'].includes(method);
   const args = namedArgs ?? (method === 'session/list' ? { _request: request } : { request });
   let response;
   try {
     response = await fetch(`${baseUrl}/api/${method}`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000),
       headers: { cookie, 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'client-request', rpcId, method, payload: { args } }) });
-  } catch { throw Error('DSH 请求失败，但写入可能已被接受。重试前请先检查原请求的执行结果。'); }
+  } catch { throw Error(readOnly ? 'DSH 连接失败（只读请求，未写入任何内容）' : 'DSH 请求失败，但写入可能已被接受。重试前请先检查原请求的执行结果。'); }
   if (response.status === 401) {
     ({ baseUrl, cookie } = await ensureDshAuth(true));
     try { response = await fetch(`${baseUrl}/api/${method}`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000), headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId, method, payload: { args } }) }); }
-    catch { throw Error('认证续期后 DSH 请求仍失败；写入结果不确定，不要重发'); }
+    catch { throw Error(readOnly ? '认证续期后 DSH 连接仍失败（只读请求，未写入任何内容）' : '认证续期后 DSH 请求仍失败；写入结果不确定，不要重发'); }
   }
   if (!response.ok) throw Error(`DSH HTTP ${response.status}${response.status === 401 ? '：请更新本地登录凭据' : ''}`);
   const body = await response.json();
@@ -100,15 +100,26 @@ export function resolveDshLocation(cwd, workspaceName, workspaces = []) {
   return { cwd: canonical(workspace.path), workspace };
 }
 
+// One session/list shared by every follow read within a second; writes that change the list clear it.
+let dshList = null;
+const dshSessions = () => {
+  if (!dshList || Date.now() - dshList.at > 1000) {
+    const promise = dshCall('session/list').catch(e => { if (dshList?.promise === promise) dshList = null; throw e; });
+    dshList = { at: Date.now(), promise };
+  }
+  return dshList.promise;
+};
+
 export async function listSessions(app, cwd) {
   let rows;
   if (app === 'claude') rows = (await claudeSessions()).map(s => {
-    const meta = JSON.parse(fs.readFileSync(path.join(home, '.claude/sessions', `${s.pid}.json`), 'utf8'));
+    let meta;
+    try { meta = JSON.parse(fs.readFileSync(path.join(home, '.claude/sessions', `${s.pid}.json`), 'utf8')); } catch { return null; }
     if (!['claude-desktop', 'cli'].includes(meta.entrypoint)) return null;
     return { sessionId: s.sessionId, cwd: s.cwd, title: s.name, status: meta.status, nativeId: meta.hostSessionId };
   }).filter(Boolean);
   else if (app === 'codex') rows = codexRows().map(({ rollout_path, ...r }) => ({ ...r, status: 'unknown' }));
-  else if (app === 'dsh') rows = (await dshCall('session/list')).items.filter(s => !s.parentSessionId).map(s => ({
+  else if (app === 'dsh') rows = (await dshSessions()).items.filter(s => !s.parentSessionId).map(s => ({
     sessionId: s.sessionId, cwd: s.cwd, status: s.running ? 'running' : 'idle', available: s.agentAvailable, projections: s.projections,
   }));
   else throw Error('不支持此应用');
@@ -189,6 +200,7 @@ export async function readSession(target) {
 
 export async function sendNative(target, text, requestId) {
   if (target.app === 'dsh') {
+    dshList = null;
     await dshCall('session/prompt', { sessionId: target.sessionId, requestId, mode: 'queue', content: [{ type: 'text', text }] });
     return { state: 'accepted', detail: 'DSH 已接受提示词，执行尚未完成' };
   }
@@ -215,6 +227,7 @@ export async function sendNative(target, text, requestId) {
 
 export async function createSession(app, cwd, requestId, title, workspaceId) {
   if (app !== 'dsh') return { state: 'unsupported', detail: '尚未验证自动创建桌面端原生对话的能力，也未用命令行对话替代' };
+  dshList = null;
   const created = await dshCall('session/create', { ...(workspaceId ? { workspaceId } : { cwd }), sessionId: requestId });
   if (title) await dshCall('session/rename', { sessionId: created.sessionId, title });
   return { state: 'created', app, sessionId: created.sessionId, cwd };

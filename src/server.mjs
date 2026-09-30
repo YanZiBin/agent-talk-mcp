@@ -100,9 +100,9 @@ tool('talk_delivery_control', '暂停或恢复投递，或将审查通过的任�
   }
   events.tick(); return result;
 });
-tool('talk_outbox', '读取近期回执、自动回传错误和事件连接状态。queued 表示排队中，可以等待；unknown/sending/held 不得重发。observed 表示已在原客户端历史中读回完全一致的消息文本。', {}, () => ({
-  deliveries: store.db.prepare('SELECT * FROM deliveries ORDER BY createdAt DESC LIMIT 50').all().map(r => ({ destination: r.destination, source: r.source, createdAt: r.createdAt, ...store.result(r) })),
-  follows: store.db.prepare('SELECT source,destination,enabled,error FROM follows').all(), events: { connectedHere: !!events.clientId, error: events.error, owner: store.db.prepare('SELECT expiresAt FROM leases WHERE name=?').get('dsh-events') || null },
+tool('talk_outbox', '读取最近 20 条回执、已开启回传的状态和事件连接状态；已关闭的回传及关闭原因用 talk_read 查看 returnRoute。queued 表示排队中，可以等待；unknown/sending/held 不得重发。observed 表示已在原客户端历史中读回完全一致的消息文本。', {}, () => ({
+  deliveries: store.db.prepare('SELECT * FROM deliveries ORDER BY createdAt DESC LIMIT 20').all().map(r => ({ destination: r.destination, source: r.source, createdAt: r.createdAt, ...store.result(r) })),
+  follows: store.db.prepare('SELECT source,destination,failures,error FROM follows WHERE enabled=1').all(), events: { connectedHere: !!events.clientId, error: events.error, owner: store.db.prepare('SELECT expiresAt FROM leases WHERE name=?').get('dsh-events') || null },
 }));
 tool('talk_follow', '将开启后新增的 DSH 最终回复、问题、异常结束和用户直接介入的消息回传给发起方 Codex/Claude 对话。接收方忙碌时等待，暂停后需明确恢复。至少一个 MCP 进程及相关原客户端须保持运行。', { source: aliasSchema, destination: aliasSchema, enabled: z.boolean().default(true) }, ({ source, destination, enabled }) => follow(source, destination, enabled));
 tool('talk_questions', '读取 DSH 的普通问题和权限请求。普通问题可用 talk_answer 回答；需要用户决定时向用户提问。权限审批只能在 DSH Web 中处理。', { alias: aliasSchema }, ({ alias }) => { store.get(alias); return { questions: questions(alias), eventError: events.error }; });
