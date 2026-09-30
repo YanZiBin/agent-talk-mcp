@@ -112,13 +112,16 @@ let polling = null, closing = false;
 function poll() {
   if (closing) return;
   events.tick();
+  // Every client session starts its own MCP process; only the lease holder polls.
+  if (!store.lease('poll', events.owner)) return;
   if (!polling) polling = delivery.poll().catch(() => { /* Individual follow/receipt errors remain in the database. */ }).finally(() => { polling = null; });
 }
 await server.connect(new StdioServerTransport());
 const timer = setInterval(poll, 3000); timer.unref(); poll();
 async function close() {
   if (closing) return; closing = true; clearInterval(timer);
-  await events.close(); await polling; await closeAdapters(); await server.close(); store.close();
+  await events.close(); await polling; store.db.prepare('DELETE FROM leases WHERE name=? AND owner=?').run('poll', events.owner);
+  await closeAdapters(); await server.close(); store.close();
 }
 process.stdin.on('end', () => void close());
 process.on('SIGINT', () => void close());

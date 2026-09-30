@@ -21,6 +21,7 @@ export class Store {
       if (!cols.has(name)) this.db.exec(`ALTER TABLE deliveries ADD COLUMN ${name} ${type}`);
     }
     if (!cols.has('state')) this.db.exec("UPDATE deliveries SET state=COALESCE(json_extract(result,'$.state'),'unknown')");
+    if (!this.db.prepare('PRAGMA table_info(follows)').all().some(c => c.name === 'failures')) this.db.exec('ALTER TABLE follows ADD COLUMN failures INTEGER NOT NULL DEFAULT 0');
     this.db.exec('COMMIT');
     } catch (e) { this.db.exec('ROLLBACK'); this.db.close(); throw e; }
   }

@@ -102,6 +102,14 @@ try {
   assert.equal(store.db.prepare("SELECT state FROM deliveries WHERE source='dsh' ORDER BY rowid DESC LIMIT 1").get().state, 'cancelled');
   assert.throws(() => store.control('dsh', 'active'), /已完成/);
   assert.throws(() => store.bind('dsh', 'dsh', 'different', dir), /其他对话/);
+  // A failing route backs off instead of retrying every tick, and closes after three failures in a row.
+  store.bind('flaky', 'dsh', 'flaky-session', dir); store.follow('flaky', 'planner', '[]');
+  const flaky = new Delivery(store, async () => { throw Error('DSH down'); }, transmit);
+  await flaky.poll(); let route = store.db.prepare("SELECT * FROM follows WHERE source='flaky'").get();
+  assert.equal(route.enabled, 1); assert.ok(route.claimUntil > Date.now()); assert.equal(route.failures, 1);
+  for (const n of [2, 3]) { store.db.prepare("UPDATE follows SET claimUntil=0 WHERE source='flaky'").run(); await flaky.poll(); }
+  route = store.db.prepare("SELECT * FROM follows WHERE source='flaky'").get();
+  assert.equal(route.enabled, 0); assert.equal(route.failures, 3); assert.match(route.error, /连续失败 3 次/);
   assert.equal(store.lease('events', 'one'), true); assert.equal(peer.lease('events', 'two'), false);
   // Permission requests cannot be converted to approvals through the ordinary answer tool.
   const events = new DshEvents(store, delivery);

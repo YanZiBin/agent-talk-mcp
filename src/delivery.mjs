@@ -8,6 +8,8 @@ export function eventId(...parts) {
   return `${h.slice(0,8)}-${h.slice(8,12)}-4${h.slice(13,16)}-a${h.slice(17,20)}-${h.slice(20,32)}`;
 }
 
+const RETRY_MS = 60000, MAX_FAILURES = 3, GIVE_UP_MS = 24 * 3600000;
+
 export class Delivery {
   constructor(store, read = readSession, transmit = sendNative) { this.store = store; this.read = read; this.transmit = transmit; }
   observe(target, snapshot) {
@@ -66,6 +68,7 @@ export class Delivery {
   async poll() {
     for (const f of this.store.db.prepare('SELECT * FROM follows WHERE enabled=1 AND claimUntil<?').all(Date.now())) {
       if (!this.store.db.prepare('UPDATE follows SET claimUntil=? WHERE source=? AND enabled=1 AND claimUntil<?').run(Date.now() + 60000, f.source, Date.now()).changes) continue;
+      let retryAt = 0;
       try {
         const source = this.store.get(f.source);
         if (source.state === 'completed') continue;
@@ -77,12 +80,18 @@ export class Delivery {
           if (!eligible(m) || seen.has(eventKey(m)) || m.text.startsWith('[Agent talk ')) continue;
           this.enqueueEvent(f.source, f.destination, eventKey(m), `${m.role === 'user' ? '用户介入' : m.event ? '运行事件' : '最终回复'}:\n${m.text}`);
         }
-        this.store.db.prepare('UPDATE follows SET seen=?,error=NULL WHERE source=?').run(JSON.stringify((snapshot.messages || []).filter(eligible).map(eventKey)), f.source);
-      } catch (e) { this.store.db.prepare('UPDATE follows SET error=? WHERE source=?').run(e.message, f.source); }
-      finally { this.store.db.prepare('UPDATE follows SET claimUntil=0 WHERE source=?').run(f.source); }
+        this.store.db.prepare('UPDATE follows SET seen=?,error=NULL,failures=0 WHERE source=?').run(JSON.stringify((snapshot.messages || []).filter(eligible).map(eventKey)), f.source);
+      } catch (e) {
+        // Failed reads back off; a route failing several times in a row is closed instead of retried forever.
+        const failures = f.failures + 1;
+        if (failures >= MAX_FAILURES) this.store.db.prepare('UPDATE follows SET enabled=0,failures=?,error=? WHERE source=?').run(failures, `连续失败 ${failures} 次，已自动关闭回传：${e.message}`, f.source);
+        else { this.store.db.prepare('UPDATE follows SET error=?,failures=? WHERE source=?').run(e.message, failures, f.source); retryAt = Date.now() + RETRY_MS; }
+      }
+      finally { this.store.db.prepare('UPDATE follows SET claimUntil=? WHERE source=?').run(retryAt, f.source); }
     }
     for (const row of this.store.db.prepare("SELECT id FROM deliveries WHERE state='queued' AND nextAt<=? ORDER BY createdAt LIMIT 20").all(Date.now())) await this.deliver(row.id);
-    for (const row of this.store.db.prepare("SELECT * FROM deliveries WHERE state IN ('unknown','sending','held') ORDER BY createdAt DESC LIMIT 20").all()) {
+    // Uncertain writes are only checked for a day; after that they stay as-is and are never resent.
+    for (const row of this.store.db.prepare("SELECT * FROM deliveries WHERE state IN ('unknown','sending','held') AND createdAt>? ORDER BY createdAt DESC LIMIT 20").all(Date.now() - GIVE_UP_MS)) {
       try {
         const target = this.store.get(row.destination);
         if (target.app !== 'claude') continue;
