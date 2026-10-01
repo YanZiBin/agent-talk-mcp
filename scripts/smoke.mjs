@@ -110,6 +110,16 @@ try {
   for (const n of [2, 3]) { store.db.prepare("UPDATE follows SET claimUntil=0 WHERE source='flaky'").run(); await flaky.poll(); }
   route = store.db.prepare("SELECT * FROM follows WHERE source='flaky'").get();
   assert.equal(route.enabled, 0); assert.equal(route.failures, 3); assert.match(route.error, /连续失败 3 次/);
+  // DSH itself being down only backs off; an unchanged history is not re-read and writes nothing.
+  store.bind('steady', 'dsh', 'steady-session', dir); store.follow('steady', 'planner', '[]', 7);
+  await new Delivery(store, async () => { throw Object.assign(Error('DSH down'), { transient: true }); }, transmit).poll();
+  route = store.db.prepare("SELECT * FROM follows WHERE source='steady'").get();
+  assert.equal(route.enabled, 1); assert.equal(route.failures, 0); assert.ok(route.claimUntil > Date.now());
+  store.db.prepare("UPDATE follows SET claimUntil=0,error=NULL WHERE source='steady'").run();
+  let since; route = store.db.prepare("SELECT * FROM follows WHERE source='steady'").get();
+  await new Delivery(store, async (t, cursor) => { since = cursor; return { unchanged: true, cursor }; }, transmit).poll();
+  assert.equal(since, 7); assert.deepEqual(store.db.prepare("SELECT * FROM follows WHERE source='steady'").get(), route);
+  store.control('steady', 'completed');
   assert.equal(store.lease('events', 'one'), true); assert.equal(peer.lease('events', 'two'), false);
   // Permission requests cannot be converted to approvals through the ordinary answer tool.
   const events = new DshEvents(store, delivery);

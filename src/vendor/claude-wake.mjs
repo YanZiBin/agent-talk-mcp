@@ -18,12 +18,18 @@ async function boundedJson(path, max = 16_384, publicMetadata = false) {
     if ((await lstat(path)).size > max) throw new Error("进程间通信元数据过大");
     return JSON.parse(await readFile(path, "utf8"));
 }
-async function liveOwner(s) {
-    if (process.platform !== "darwin" || !Number.isSafeInteger(s.pid) || s.pid < 1) return false;
+// One ps call checks every session, instead of one child process per session.
+async function liveOwners(list) {
+    const live = new Set();
+    const candidates = list.filter((s)=>Number.isSafeInteger(s.pid) && s.pid > 0);
+    if (process.platform !== "darwin" || !candidates.length) return live;
+    let stdout;
     try {
-        const { stdout } = await execute("/bin/ps", [
+        ({ stdout } = await execute("/bin/ps", [
             "-p",
-            String(s.pid),
+            candidates.map((s)=>s.pid).join(","),
+            "-o",
+            "pid=",
             "-o",
             "uid=",
             "-o",
@@ -35,13 +41,21 @@ async function liveOwner(s) {
                 TZ: "UTC",
                 LC_ALL: "C"
             }
-        });
-        const match = stdout.trim().match(/^(\d+)\s+(.+)$/);
-        return !!match && Number(match[1]) === process.getuid?.() && match[2].replace(/\s+/g, " ") === s.procStart.replace(/\s+/g, " ");
-    } catch  {
-        return false;
+        }));
+    } catch (e) {
+        // ps may exit non-zero when some listed pids are gone; the rows it did print are still valid.
+        stdout = e.killed ? "" : e.stdout || "";
     }
+    for (const line of stdout.split("\n")){
+        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+        if (!match || Number(match[2]) !== process.getuid?.()) continue;
+        for (const s of candidates)if (s.pid === Number(match[1]) && match[3].replace(/\s+/g, " ") === s.procStart.replace(/\s+/g, " ")) live.add(s);
+    }
+    return live;
 }
+const liveOwner = async (s)=>(await liveOwners([
+        s
+    ])).has(s);
 export async function claudeSessions(root = sessionRoot()) {
     if (process.platform !== "darwin") return [];
     let files;
@@ -74,10 +88,11 @@ export async function claudeSessions(root = sessionRoot()) {
                 peerProtocol: raw.peerProtocol
             };
             await privatePath(session.messagingSocketPath, "socket");
-            if (await liveOwner(session)) sessions.push(session);
+            sessions.push(session);
         } catch  {}
     }
-    return sessions;
+    const live = await liveOwners(sessions);
+    return sessions.filter((s)=>live.has(s));
 }
 export class ClaudeWake {
     onLateReceipt;

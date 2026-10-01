@@ -35,8 +35,11 @@ function codexRows(sessionId) {
   } finally { db.close(); }
 }
 
+// DSH itself being down or logged out: callers back off instead of blaming one conversation.
+const transient = e => Object.assign(e, { transient: true });
+
 export async function dshCall(method, request = {}, namedArgs) {
-  let { baseUrl, cookie } = await ensureDshAuth();
+  let { baseUrl, cookie } = await ensureDshAuth().catch(e => { throw transient(e); });
   const rpcId = randomUUID(), readOnly = ['session/list', 'session/page'].includes(method);
   const args = namedArgs ?? (method === 'session/list' ? { _request: request } : { request });
   let response;
@@ -44,13 +47,13 @@ export async function dshCall(method, request = {}, namedArgs) {
     response = await fetch(`${baseUrl}/api/${method}`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000),
       headers: { cookie, 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'client-request', rpcId, method, payload: { args } }) });
-  } catch { throw Error(readOnly ? 'DSH 连接失败（只读请求，未写入任何内容）' : 'DSH 请求失败，但写入可能已被接受。重试前请先检查原请求的执行结果。'); }
+  } catch { throw transient(Error(readOnly ? 'DSH 连接失败（只读请求，未写入任何内容）' : 'DSH 请求失败，但写入可能已被接受。重试前请先检查原请求的执行结果。')); }
   if (response.status === 401) {
-    ({ baseUrl, cookie } = await ensureDshAuth(true));
+    ({ baseUrl, cookie } = await ensureDshAuth(true).catch(e => { throw transient(e); }));
     try { response = await fetch(`${baseUrl}/api/${method}`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000), headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId, method, payload: { args } }) }); }
-    catch { throw Error(readOnly ? '认证续期后 DSH 连接仍失败（只读请求，未写入任何内容）' : '认证续期后 DSH 请求仍失败；写入结果不确定，不要重发'); }
+    catch { throw transient(Error(readOnly ? '认证续期后 DSH 连接仍失败（只读请求，未写入任何内容）' : '认证续期后 DSH 请求仍失败；写入结果不确定，不要重发')); }
   }
-  if (!response.ok) throw Error(`DSH HTTP ${response.status}${response.status === 401 ? '：请更新本地登录凭据' : ''}`);
+  if (!response.ok) throw transient(Error(`DSH HTTP ${response.status}${response.status === 401 ? '：请更新本地登录凭据' : ''}`));
   const body = await response.json();
   if (body.rpcId !== rpcId || body.type !== 'server-response') throw Error('无法识别 DSH 回执');
   if (!body.result?.ok) throw Error(`DSH ${body.result?.error?.code}: ${body.result?.error?.message}`);
@@ -128,7 +131,7 @@ export async function listSessions(app, cwd) {
 
 export const textParts = content => typeof content === 'string' ? content : (content || []).filter(p => ['text', 'input_text', 'output_text'].includes(p.type)).map(p => p.text || '').join('\n');
 
-export async function readSession(target) {
+export async function readSession(target, sinceCursor = null) {
   checkId(target.sessionId);
   if (target.app === 'dsh') {
     const row = (await listSessions('dsh')).find(s => s.sessionId === target.sessionId);
@@ -136,6 +139,8 @@ export async function readSession(target) {
     if (canonical(row.cwd) !== target.cwd) throw Error('对话目录已发生变化');
     const seq = row.projections?.asOfSeq;
     if (!Number.isSafeInteger(seq)) throw Error('DSH 对话缺少已验证的历史记录位置');
+    // Same asOfSeq means the same page (it is the page's throughSeq), so skip fetching it.
+    if (seq === sinceCursor) return { unchanged: true, status: row.status, cursor: seq };
     const page = await dshCall('session/page', { address: { kind: 'session', sessionId: target.sessionId }, throughSeq: seq, maxMessages: 40 });
     const events = page.records.filter(r => r.type === 'event').map(r => r.event);
     const endings = events.filter(e => e.type === 'turn/end');

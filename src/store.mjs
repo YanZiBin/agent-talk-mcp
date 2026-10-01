@@ -7,7 +7,7 @@ export class Store {
   constructor(file) {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(file); fs.chmodSync(file, 0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
+    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA journal_size_limit=1048576;
       CREATE TABLE IF NOT EXISTS sessions(alias TEXT PRIMARY KEY, app TEXT NOT NULL, sessionId TEXT NOT NULL, cwd TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', resumeKey TEXT, UNIQUE(app,sessionId));
       CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, destination TEXT NOT NULL, fingerprint TEXT NOT NULL, body TEXT NOT NULL, result TEXT, createdAt INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS follows(source TEXT PRIMARY KEY, destination TEXT NOT NULL, seen TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, claimUntil INTEGER NOT NULL DEFAULT 0, error TEXT);
@@ -21,7 +21,11 @@ export class Store {
       if (!cols.has(name)) this.db.exec(`ALTER TABLE deliveries ADD COLUMN ${name} ${type}`);
     }
     if (!cols.has('state')) this.db.exec("UPDATE deliveries SET state=COALESCE(json_extract(result,'$.state'),'unknown')");
-    if (!this.db.prepare('PRAGMA table_info(follows)').all().some(c => c.name === 'failures')) this.db.exec('ALTER TABLE follows ADD COLUMN failures INTEGER NOT NULL DEFAULT 0');
+    const followCols = new Set(this.db.prepare('PRAGMA table_info(follows)').all().map(c => c.name));
+    if (!followCols.has('failures')) this.db.exec('ALTER TABLE follows ADD COLUMN failures INTEGER NOT NULL DEFAULT 0');
+    if (!followCols.has('cursor')) this.db.exec('ALTER TABLE follows ADD COLUMN cursor INTEGER');
+    // Receipts older than 90 days are no longer worth keeping; queued ones still have work to do.
+    this.db.prepare("DELETE FROM deliveries WHERE createdAt<? AND state!='queued'").run(Date.now() - 90 * 86400000);
     this.db.exec('COMMIT');
     } catch (e) { this.db.exec('ROLLBACK'); this.db.close(); throw e; }
   }
@@ -73,7 +77,7 @@ export class Store {
     this.db.prepare("UPDATE deliveries SET state=?,result=?,nextAt=? WHERE id=? AND state='queued'").run(result.state, JSON.stringify(result), Date.now() + delay, id);
   }
   claim(id) { return !!this.db.prepare("UPDATE deliveries SET state='sending' WHERE id=? AND state='queued' AND EXISTS (SELECT 1 FROM sessions WHERE alias=deliveries.destination AND state='active')").run(id).changes; }
-  follow(source, destination, seen) {
+  follow(source, destination, seen, cursor = null) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const edges = new Map(this.db.prepare('SELECT source,destination FROM follows WHERE enabled=1').all().map(r => [r.source, r.destination]));
@@ -83,11 +87,14 @@ export class Store {
         if (visited.has(next)) throw Error('此自动回传设置会形成消息循环');
         visited.add(next); next = edges.get(next);
       }
-      this.db.prepare('INSERT INTO follows(source,destination,seen,enabled) VALUES(?,?,?,1) ON CONFLICT(source) DO UPDATE SET destination=excluded.destination,seen=excluded.seen,enabled=1').run(source, destination, seen);
+      this.db.prepare('INSERT INTO follows(source,destination,seen,cursor,enabled) VALUES(?,?,?,?,1) ON CONFLICT(source) DO UPDATE SET destination=excluded.destination,seen=excluded.seen,cursor=excluded.cursor,enabled=1,failures=0,error=NULL,claimUntil=0').run(source, destination, seen, cursor);
       this.db.exec('COMMIT');
     } catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
   lease(name, owner, ttl = 60000) {
+    // Every process asks every tick; only write (and fsync) when the lease is free or past half its TTL.
+    const held = this.db.prepare('SELECT owner,expiresAt FROM leases WHERE name=?').get(name), now = Date.now();
+    if (held && held.expiresAt - now > (held.owner === owner ? ttl / 2 : 0)) return held.owner === owner;
     this.db.prepare('INSERT INTO leases VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,expiresAt=excluded.expiresAt WHERE leases.owner=excluded.owner OR leases.expiresAt<?').run(name, owner, Date.now() + ttl, Date.now());
     return this.db.prepare('SELECT owner FROM leases WHERE name=?').get(name).owner === owner;
   }
