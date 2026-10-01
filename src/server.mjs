@@ -42,7 +42,7 @@ async function follow(source, destination, enabled = true) {
   const old = store.db.prepare('SELECT * FROM follows WHERE source=?').get(source);
   if (old?.enabled && old.destination === destination) return { source, destination, enabled: true, unchanged: true };
   const snapshot = await readSession(src);
-  store.follow(source, destination, JSON.stringify((snapshot.messages || []).filter(eligible).map(eventKey)));
+  store.follow(source, destination, JSON.stringify((snapshot.messages || []).filter(eligible).map(eventKey)), snapshot.cursor ?? null);
   events.tick();
   return { source, destination, enabled: true, startsAfterCurrentHistory: true };
 }
@@ -120,6 +120,8 @@ await server.connect(new StdioServerTransport());
 const timer = setInterval(poll, 3000); timer.unref(); poll();
 async function close() {
   if (closing) return; closing = true; clearInterval(timer);
+  // Never outlive the client: if DSH hangs the in-flight poll, exit anyway.
+  setTimeout(() => process.exit(0), 5000).unref();
   await events.close(); await polling; store.db.prepare('DELETE FROM leases WHERE name=? AND owner=?').run('poll', events.owner);
   await closeAdapters(); await server.close(); store.close();
 }
