@@ -191,8 +191,8 @@ args = ["/absolute/path/to/agent-talk-mcp/src/server.mjs"]
 | `talk_bind` | 将精确的会话及目录绑定到固定别名。 |
 | `talk_models` | 读取 DSH 可用模型、可选思考程度，以及是否支持快速档。 |
 | `talk_create` | 创建 DSH 对话，默认开启自动回传；可选 `model`、`effort`、`speed` 指定模型、思考程度和速度（选模型会同时成为 DSH 之后的默认模型；快速档仅限 codex 模型，DSH 重启后恢复标准速度）。 |
-| `talk_send` | 发送提示词和本地文件路径，按请求 ID 防重复。 |
-| `talk_read` | 读取近期消息、进度、运行状态、问题和回传状态。 |
+| `talk_send` | 向 DSH 对话发送提示词和本地文件路径，按请求 ID 防重复。Codex/Claude 对话之间不直接互发。 |
+| `talk_read` | 读取 DSH 对话的近期消息、进度、运行状态、问题和回传状态。 |
 | `talk_follow` | 开启或关闭 DSH 到发起对话的回传。 |
 | `talk_questions` | 查看普通问题和权限请求。 |
 | `talk_answer` | 回答普通问题，不代答权限审批。 |

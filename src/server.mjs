@@ -22,6 +22,12 @@ function returnStatus(alias) {
   const last = store.db.prepare('SELECT * FROM deliveries WHERE source=? AND destination=? ORDER BY createdAt DESC,rowid DESC LIMIT 1').get(alias, route?.destination || '');
   return { returnRoute: route ? { ...route, enabled: !!route.enabled } : { enabled: false }, lastReturn: last ? store.result(last) : null };
 }
+// Only DSH conversations are read or prompted directly; Codex/Claude conversations only receive DSH returns.
+function dshTarget(alias) {
+  const target = store.get(alias);
+  if (target.app !== 'dsh') throw Error('只支持 DSH 对话；Codex/Claude 对话只接收 DSH 的自动回传，彼此之间不直接互发');
+  return target;
+}
 function questions(alias) {
   return store.db.prepare('SELECT id,kind,request,state FROM questions WHERE source=? ORDER BY rowid DESC LIMIT 30').all(alias).map(q => ({ ...q, request: JSON.parse(q.request) }));
 }
@@ -59,12 +65,13 @@ tool('talk_bind', '将精确的已有对话和目录绑定到固定别名。用�
   const target = store.bind(alias, app, sessionId, cwd, snapshot.pauseKey);
   return snapshot.status === 'paused' && target.state === 'active' ? store.control(alias, 'paused', snapshot.pauseKey) : target;
 });
-tool('talk_read', '读取原客户端状态、近期进度、最终回复、用户消息和问题。returnRoute 显示自动回传是否开启，lastReturn 显示最近回传回执；held 表示接收方暂存、尚未交给模型，不代表回传未开启，不得重发。桥接状态 paused 表示暂停，即使原客户端状态变化也需明确恢复。truncated=true 表示省略了较早历史；idle 只表示空闲，不代表审查通过。', { alias: aliasSchema }, async ({ alias }) => {
-  const snapshot = await readSession(store.get(alias));
+tool('talk_read', '读取 DSH 对话的状态、近期进度、最终回复、用户消息和问题。returnRoute 显示自动回传是否开启，lastReturn 显示最近回传回执；held 表示接收方暂存、尚未交给模型，不代表回传未开启，不得重发。桥接状态 paused 表示暂停，即使原客户端状态变化也需明确恢复。truncated=true 表示省略了较早历史；idle 只表示空闲，不代表审查通过。', { alias: aliasSchema }, async ({ alias }) => {
+  const snapshot = await readSession(dshTarget(alias));
   const pending = questions(alias);
   return { conversation: delivery.observe(store.get(alias), snapshot), ...snapshot, nativeStatus: snapshot.status, status: snapshot.status === 'running' && pending.some(q => q.state === 'pending') ? 'needs_input' : snapshot.status, questions: pending, ...returnStatus(alias) };
 });
-tool('talk_send', '向已绑定的对话发送提示词和本地文件路径。同一 requestId 不会重复发送。接收方忙碌或暂时不可用时，消息持久保存到队列。发送结果不确定时绝不重发。文件保留在本机。', { destination: aliasSchema, requestId: idSchema, prompt: z.string().min(1).max(100000), files: z.array(z.string()).max(30).optional() }, async ({ destination, requestId, prompt, files = [] }) => {
+tool('talk_send', '向已绑定的 DSH 对话发送提示词和本地文件路径。同一 requestId 不会重复发送。接收方忙碌或暂时不可用时，消息持久保存到队列。发送结果不确定时绝不重发。文件保留在本机。', { destination: aliasSchema, requestId: idSchema, prompt: z.string().min(1).max(100000), files: z.array(z.string()).max(30).optional() }, async ({ destination, requestId, prompt, files = [] }) => {
+  dshTarget(destination);
   for (const file of files) if (!path.isAbsolute(file) || !fs.existsSync(file)) throw Error('每个文件都必须是本机已存在的绝对路径');
   // 保留已发送消息的固定格式，避免同一 requestId 重试时因翻译而改变内容指纹。
   const text = `[Agent talk message ${requestId}]\n${prompt}${files.length ? '\n\nLocal file paths:\n' + files.join('\n') : ''}`;
