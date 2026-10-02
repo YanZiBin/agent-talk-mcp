@@ -40,17 +40,19 @@ const transient = e => Object.assign(e, { transient: true });
 
 export async function dshCall(method, request = {}, namedArgs) {
   let { baseUrl, cookie } = await ensureDshAuth().catch(e => { throw transient(e); });
-  const rpcId = randomUUID(), readOnly = ['session/list', 'session/page'].includes(method);
+  const rpcId = randomUUID(), readOnly = ['session/list', 'session/page', 'session/modelCatalog', 'subscriptions-auth.speed'].includes(method);
   const args = namedArgs ?? (method === 'session/list' ? { _request: request } : { request });
+  // The subscriptions plugin's /api routes take the request itself as payload, not wrapped in args.
+  const payload = method.startsWith('subscriptions-auth.') ? request : { args };
   let response;
   try {
     response = await fetch(`${baseUrl}/api/${method}`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000),
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-request', rpcId, method, payload: { args } }) });
+      body: JSON.stringify({ type: 'client-request', rpcId, method, payload }) });
   } catch { throw transient(Error(readOnly ? 'DSH 连接失败（只读请求，未写入任何内容）' : 'DSH 请求失败，但写入可能已被接受。重试前请先检查原请求的执行结果。')); }
   if (response.status === 401) {
     ({ baseUrl, cookie } = await ensureDshAuth(true).catch(e => { throw transient(e); }));
-    try { response = await fetch(`${baseUrl}/api/${method}`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000), headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId, method, payload: { args } }) }); }
+    try { response = await fetch(`${baseUrl}/api/${method}`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000), headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId, method, payload }) }); }
     catch { throw transient(Error(readOnly ? '认证续期后 DSH 连接仍失败（只读请求，未写入任何内容）' : '认证续期后 DSH 请求仍失败；写入结果不确定，不要重发')); }
   }
   if (!response.ok) throw transient(Error(`DSH HTTP ${response.status}${response.status === 401 ? '：请更新本地登录凭据' : ''}`));
@@ -236,6 +238,40 @@ export async function createSession(app, cwd, requestId, title, workspaceId) {
   const created = await dshCall('session/create', { ...(workspaceId ? { workspaceId } : { cwd }), sessionId: requestId });
   if (title) await dshCall('session/rename', { sessionId: created.sessionId, title });
   return { state: 'created', app, sessionId: created.sessionId, cwd };
+}
+
+// Model list with each model's reasoning efforts and, when the subscriptions plugin is installed, fast-tier support.
+export async function dshModels() {
+  const catalog = await dshCall('session/modelCatalog', {}, {});
+  let fast = [];
+  try { fast = (await dshCall('subscriptions-auth.speed', { sessionId: 'agent-talk-probe' })).fastModels; } catch {}
+  return { catalog, fast };
+}
+
+// Validated against the live catalog before the session is created, so a bad value leaves no empty conversation behind.
+export async function resolveDshSettings({ provider, model, effort, speed }) {
+  const { catalog, fast } = await dshModels(), pick = model !== undefined || effort !== undefined;
+  if (model === undefined) {
+    if (provider !== undefined) throw Error('指定 provider 时也要指定 model');
+    ({ provider, model } = catalog.default ?? {});
+    if (!model) throw Error('DSH 没有默认模型，请明确指定 model');
+  }
+  const groups = catalog.groups.filter(g => (provider === undefined || g.id === provider) && g.models.some(m => m.id === model));
+  if (groups.length !== 1) throw Error(groups.length ? `模型 ${model} 同时属于 ${groups.map(g => g.id).join('、')}，请用 provider 指定其一` : `DSH 中没有可用的模型 ${provider ? provider + '/' : ''}${model}，请用 talk_models 查看可选模型`);
+  provider = groups[0].id;
+  const info = groups[0].models.find(m => m.id === model), efforts = (info.reasoning?.efforts ?? []).map(e => e.id);
+  // OpenAI lists "ultra" for some GPT models, but it is a Codex-client mode (max + automatic sub-agent delegation); the API answers HTTP 400.
+  if (effort === 'ultra' && provider === 'codex') throw Error('ultra 是 Codex 客户端专属模式（max 思考 + 自动派发子任务），OpenAI 接口不接受，DSH 中会报 HTTP 400；请改用 max');
+  if (effort !== undefined && !efforts.includes(effort)) throw Error(efforts.length ? `${model} 支持的思考程度：${efforts.join('、')}` : `${model} 不支持设置思考程度`);
+  if (speed === 'fast' && !(provider === 'codex' && fast.includes(model))) throw Error(`${model} 不支持快速档（需要订阅插件，且仅限支持 fast 的 codex 模型）`);
+  return { provider, model, effort, speed, pick };
+}
+
+export async function applyDshSettings(sessionId, { provider, model, effort, speed, pick }) {
+  const result = {};
+  if (pick) result.model = (await dshCall('session/selectModel', { sessionId, provider, model, ...(effort === undefined ? {} : { reasoningEffort: effort }) })).selected;
+  if (speed !== undefined) { await dshCall('subscriptions-auth.setSpeed', { sessionId, tier: speed }); result.speed = speed; }
+  return result;
 }
 
 export async function codexProbe(sessionId) {

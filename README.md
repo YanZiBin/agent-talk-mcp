@@ -185,7 +185,8 @@ Workspace names must match exactly. Missing names produce an error; duplicate na
 | `talk_list` | List native conversations, optionally filtered by exact directory. |
 | `talk_workspaces` | Read existing DSH workspace names, directories, and conversation counts. |
 | `talk_bind` | Bind an exact native conversation and directory to a stable alias. |
-| `talk_create` | Create a DSH conversation with automatic return by default. |
+| `talk_models` | Read DSH's available models, their reasoning efforts, and fast-tier support. |
+| `talk_create` | Create a DSH conversation with automatic return by default; optional `model`, `effort`, and `speed` pick the model, reasoning effort, and speed (DSH also saves the model choice as its default for later conversations; the fast tier is codex-only and resets to standard when DSH restarts). |
 | `talk_send` | Send a prompt and local file paths with request-ID deduplication. |
 | `talk_read` | Read recent messages, progress, native state, questions, and return status. |
 | `talk_follow` | Enable or disable a DSH → initiating conversation return route. |

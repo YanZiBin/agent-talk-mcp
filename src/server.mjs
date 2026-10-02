@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { Store } from './store.mjs';
 import { Delivery, eligible, eventKey } from './delivery.mjs';
 import { DshEvents } from './dsh-events.mjs';
-import { listSessions, listWorkspaces, resolveDshLocation, readSession, createSession, dshCall, closeAdapters, canonical, projectRoot } from './adapters.mjs';
+import { listSessions, listWorkspaces, resolveDshLocation, readSession, createSession, resolveDshSettings, applyDshSettings, dshModels, dshCall, closeAdapters, canonical, projectRoot } from './adapters.mjs';
 
 process.umask(0o077);
 z.setErrorMap(issue => ({ message: `参数校验失败（${issue.code}），请检查字段的类型、格式和取值范围。` }));
@@ -49,6 +49,10 @@ async function follow(source, destination, enabled = true) {
 
 tool('talk_list', '列出原客户端中的对话。cwd 按精确目录筛选；Claude 列出正在运行的 Desktop Code 对话，Codex 列出近期本地任务。不绑定或恢复对话。', { app: appSchema, cwd: z.string().optional() }, async ({ app, cwd }) => ({ sessions: await listSessions(app, cwd), limit: app === 'codex' ? 200 : null }));
 tool('talk_workspaces', '列出已有 DSH 工作区的精确名称和目录。只读，不创建或重命名工作区。在 talk_create 中使用 workspaceName 选择工作区。', {}, async () => ({ workspaces: (await listWorkspaces()).map(w => ({ workspaceId: w.workspaceId, name: w.title, cwd: w.path, conversationCount: w.sessionIds.length })) }));
+tool('talk_models', '列出 DSH 当前可用的模型：provider、model、可选思考程度（efforts）、默认思考程度，以及是否支持快速档（fast）。只读。在 talk_create 中用 provider/model/effort/speed 指定。', {}, async () => {
+  const { catalog, fast } = await dshModels();
+  return { default: catalog.default ?? null, providers: catalog.groups.map(g => ({ provider: g.id, name: g.name, models: g.models.map(m => ({ model: m.id, name: m.name, efforts: (m.reasoning?.efforts ?? []).map(e => e.id).filter(e => !(g.id === 'codex' && e === 'ultra')), defaultEffort: m.reasoning?.defaultEffort ?? null, fast: g.id === 'codex' && fast.includes(m.id) })) })), failures: catalog.failures ?? [] };
+});
 tool('talk_bind', '将精确的已有对话和目录绑定到固定别名。用此工具绑定当前发起任务的 Codex/Claude 对话。不发送消息。', { alias: aliasSchema, app: appSchema, sessionId: z.string(), cwd: z.string() }, async ({ alias, app, sessionId, cwd }) => {
   cwd = canonical(cwd);
   const snapshot = await readSession({ app, sessionId, cwd });
@@ -67,9 +71,10 @@ tool('talk_send', '向已绑定的对话发送提示词和本地文件路径。�
   if (Buffer.byteLength(text) > 120000) throw Error('消息超出桥接大小限制，请改为发送本地文档路径');
   return delivery.submit(destination, text, requestId);
 });
-tool('talk_create', '创建 DSH 原生对话。workspaceName 按精确名称选择已有 DSH 工作区，其目录作为 cwd；不指定工作区时需提供 cwd，对话进入未分组。同时提供两者时目录必须一致。默认开启自动回传：先绑定当前发起方 Codex/Claude 对话，再将别名填入 replyTo；创建成功即开启，无需额外调用 talk_follow。只有用户明确不要回传时才设置 autoReturn=false 并省略 replyTo；缺少目标会报错，不会静默关闭回传。相同别名和 ID 复用同一对话；调用 talk_send 前不会派发任务。', { alias: aliasSchema, app: z.literal('dsh').default('dsh'), cwd: z.string().optional(), workspaceName: z.string().min(1).max(255).optional(), requestId: idSchema, title: z.string().max(120).optional(), replyTo: aliasSchema.optional(), autoReturn: z.boolean().default(true) }, async ({ alias, app, cwd, workspaceName, requestId, title, replyTo, autoReturn }) => {
+tool('talk_create', '创建 DSH 原生对话。workspaceName 按精确名称选择已有 DSH 工作区，其目录作为 cwd；不指定工作区时需提供 cwd，对话进入未分组。同时提供两者时目录必须一致。默认开启自动回传：先绑定当前发起方 Codex/Claude 对话，再将别名填入 replyTo；创建成功即开启，无需额外调用 talk_follow。只有用户明确不要回传时才设置 autoReturn=false 并省略 replyTo；缺少目标会报错，不会静默关闭回传。相同别名和 ID 复用同一对话；调用 talk_send 前不会派发任务。可选 model/effort/speed 为该对话指定模型、思考程度和速度，取值先用 talk_models 查询；不传则用 DSH 默认模型。注意：DSH 会把这次的模型选择同时存为之后新建对话的默认模型；speed=fast 仅限支持快速档的 codex 模型，DSH 重启后回到标准速度。', { alias: aliasSchema, app: z.literal('dsh').default('dsh'), cwd: z.string().optional(), workspaceName: z.string().min(1).max(255).optional(), requestId: idSchema, title: z.string().max(120).optional(), replyTo: aliasSchema.optional(), autoReturn: z.boolean().default(true), provider: z.string().min(1).max(100).optional(), model: z.string().min(1).max(200).optional(), effort: z.string().min(1).max(50).optional(), speed: z.enum(['standard', 'fast']).optional() }, async ({ alias, app, cwd, workspaceName, requestId, title, replyTo, autoReturn, provider, model, effort, speed }) => {
   if (autoReturn && !replyTo) throw Error('新建 DSH 对话默认开启自动回传。请先用 talk_bind 绑定当前发起对话，再提供 replyTo；只有用户明确不要回传时才传 autoReturn=false。');
   if (!autoReturn && replyTo) throw Error('autoReturn=false 与 replyTo 冲突；关闭回传时请省略 replyTo。');
+  const wanted = [provider, model, effort, speed].some(v => v !== undefined) && await resolveDshSettings({ provider, model, effort, speed });
   const location = resolveDshLocation(cwd, workspaceName, workspaceName === undefined ? [] : await listWorkspaces());
   cwd = location.cwd;
   const workspace = location.workspace;
@@ -88,7 +93,8 @@ tool('talk_create', '创建 DSH 原生对话。workspaceName 按精确名称选�
     const route = store.db.prepare('SELECT destination FROM follows WHERE source=? AND enabled=1').get(alias);
     if (route) await follow(alias, route.destination, false);
   }
-  return { ...target, ...returnStatus(alias), ...(workspace ? { workspace: { workspaceId: workspace.workspaceId, name: workspace.title, cwd } } : {}) };
+  const settings = wanted && await applyDshSettings(target.sessionId, wanted);
+  return { ...target, ...returnStatus(alias), ...(workspace ? { workspace: { workspaceId: workspace.workspaceId, name: workspace.title, cwd } } : {}), ...(settings ? { settings } : {}) };
 });
 tool('talk_delivery_control', '暂停或恢复投递，或将审查通过的任务标记完成。暂停 DSH 时也会请求原客户端停止并取消排队中的提示；暂停桌面对话只会暂停桥接投递。明确设置 active 才会恢复原客户端停止后的投递。标记完成会关闭回传，不会归档。', { alias: aliasSchema, state: z.enum(['active', 'paused', 'completed']) }, async ({ alias, state }) => {
   const target = store.get(alias);

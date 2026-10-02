@@ -189,7 +189,8 @@ args = ["/absolute/path/to/agent-talk-mcp/src/server.mjs"]
 | `talk_list` | 列出原客户端对话，可按精确目录筛选。 |
 | `talk_workspaces` | 读取已有 DSH 工作区的名称、目录和对话数量。 |
 | `talk_bind` | 将精确的会话及目录绑定到固定别名。 |
-| `talk_create` | 创建 DSH 对话，默认开启自动回传。 |
+| `talk_models` | 读取 DSH 可用模型、可选思考程度，以及是否支持快速档。 |
+| `talk_create` | 创建 DSH 对话，默认开启自动回传；可选 `model`、`effort`、`speed` 指定模型、思考程度和速度（选模型会同时成为 DSH 之后的默认模型；快速档仅限 codex 模型，DSH 重启后恢复标准速度）。 |
 | `talk_send` | 发送提示词和本地文件路径，按请求 ID 防重复。 |
 | `talk_read` | 读取近期消息、进度、运行状态、问题和回传状态。 |
 | `talk_follow` | 开启或关闭 DSH 到发起对话的回传。 |
