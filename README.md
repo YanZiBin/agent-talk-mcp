@@ -187,8 +187,8 @@ Workspace names must match exactly. Missing names produce an error; duplicate na
 | `talk_bind` | Bind an exact native conversation and directory to a stable alias. |
 | `talk_models` | Read DSH's available models, their reasoning efforts, and fast-tier support. |
 | `talk_create` | Create a DSH conversation with automatic return by default; optional `model`, `effort`, and `speed` pick the model, reasoning effort, and speed (DSH also saves the model choice as its default for later conversations; the fast tier is codex-only and resets to standard when DSH restarts). |
-| `talk_send` | Send a prompt and local file paths with request-ID deduplication. |
-| `talk_read` | Read recent messages, progress, native state, questions, and return status. |
+| `talk_send` | Send a prompt and local file paths to a DSH conversation with request-ID deduplication. Codex and Claude conversations do not message each other directly. |
+| `talk_read` | Read a DSH conversation's recent messages, progress, native state, questions, and return status. |
 | `talk_follow` | Enable or disable a DSH → initiating conversation return route. |
 | `talk_questions` | Inspect ordinary questions and permission requests. |
 | `talk_answer` | Answer ordinary questions; never grant permission approvals. |
