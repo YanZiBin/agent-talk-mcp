@@ -36,6 +36,7 @@ flowchart LR
 |---|---|
 | Use existing conversations | Bind exact native conversation IDs and directories; continue chatting in the original apps. |
 | Create DSH conversations | Choose an existing DSH workspace by name, or start in a local directory. |
+| Delegate to the Claude Code CLI | Run tasks in a headless `claude -p` worker in a local directory, with results, questions, and rework on the same Claude session. |
 | Delegate with local files | Send a prompt and absolute paths to Markdown, images, PDFs, or other material. The recipient reads the files using its own capabilities. |
 | Receive results and questions | New DSH conversations require a return destination by default. Ordinary questions can be answered from the initiating conversation. |
 | Inspect progress | Read recent messages, tool activity, native state, and delivery receipts. |
@@ -43,16 +44,17 @@ flowchart LR
 | Pause and finish | Pause one task without pausing the others; mark reviewed work complete to prevent reuse. |
 | Renew DSH credentials | A small DSH extension supplies the local login URL; the bridge renews its cookie when needed. |
 
-**Scope:** this version automatically creates DSH conversations only. It does not create replacement Codex/Claude CLI sessions, automate browser clicks, or archive conversations.
+**Scope:** this version creates DSH conversations and headless Claude Code CLI workers. It does not create Codex or Claude Desktop conversations, automate browser clicks, or archive conversations.
 
 ## Requirements and compatibility
 
-This is an early, source-installed release (`0.4.0`), intended for a trusted local machine.
+This is an early, source-installed release (`0.5.0`), intended for a trusted local machine.
 
 - **macOS** is the currently supported environment. The Claude native adapter is macOS-only; Windows/Linux support has not been validated.
 - **Node.js 22.13 or later** and npm. Node.js **22.23.2** was used for local verification. Node's SQLite experimental warning may appear.
 - Codex Desktop and/or **Claude Desktop Code**, signed in and able to run a local stdio MCP server. Regular Claude web chats are not supported by this adapter.
-- A working **DSH Web** installation on the same machine, with access to the same local files.
+- A working **DSH Web** installation on the same machine, with access to the same local files, for the DSH executor.
+- The **Claude Code CLI**, signed in, for the Claude CLI executor.
 - The native apps and the receiving conversation must remain available for automatic return.
 
 Local verification used **Claude Code 2.1.280** and **DSH 0.1.7-rc.1**, plus the installed Codex Desktop. These are compatibility observations, not a guarantee for every release. Native IPC and DSH RPC interfaces can change independently of MCP.
@@ -174,6 +176,17 @@ You normally do not need to name the MCP explicitly. The AI selects tools from t
 5. The initiator interprets the result in the context of the user's goal. It should summarize from its own perspective, distinguish reported claims from verified facts, and quote verbatim only when requested.
 6. Revisions can continue in the same executor conversation. Once reviewed work is marked `completed`, use a new conversation for the next task.
 
+### Claude Code CLI executor
+
+`talk_create` with `app: "claude-cli"` and an absolute `cwd` registers a headless Claude Code worker (default `app` stays `dsh`). Optional `model` and `effort` are passed to `claude --model/--effort`; DSH-only fields (`workspaceName`, `provider`, `speed`) are rejected. Nothing starts until `talk_send`:
+
+- Each message starts one `claude -p --output-format stream-json` turn in `cwd`, with the prompt on stdin. The first turn uses `--session-id <requestId>`; later turns (rework) use `--resume` on the same session.
+- When the process exits, its final result (or an abnormal end) is returned to the `replyTo` conversation through the same delivery path as DSH. This executor is driven by process output and adds nothing to the 3-second poll.
+- **Permissions are fully skipped** (`--dangerously-skip-permissions`). Claude Code's documentation recommends this mode only in containers or VMs; use it only in directories you trust the worker with.
+- Mid-task questions: the worker gets a `talk_ask` tool (injected with `--mcp-config`, served by `src/claude-ask.mjs`). It blocks until the initiating conversation answers with `talk_answer` (answer id `q`), then Claude continues in the same turn. `AskUserQuestion` and the user-scope `agent-talk` tools are disallowed inside the worker.
+- At most one process runs per conversation; messages sent meanwhile queue and start when the current turn ends. Pausing with `talk_delivery_control` sends SIGINT to end the turn. Closing the MCP process (for example quitting Codex) interrupts its workers.
+- If the client cannot find `claude` on its `PATH`, set `AGENT_TALK_CLAUDE_BIN` to the absolute path (`command -v claude`) in the MCP server's environment.
+
 `autoReturn: false` explicitly opts out when creating a conversation and must not be combined with `replyTo`. Existing DSH conversations can be bound and then linked with `talk_follow`; starting a follow watches **new** events, not the entire previous history. New defaults do not retroactively enable old routes.
 
 Workspace names must match exactly. Missing names produce an error; duplicate names require an exact `cwd`. If `workspaceName` and `cwd` are both provided, they must agree. Put a separate execution/worktree path in the task instructions. Without a workspace name, `cwd` creates an ungrouped DSH conversation.
@@ -186,9 +199,9 @@ Workspace names must match exactly. Missing names produce an error; duplicate na
 | `talk_workspaces` | Read existing DSH workspace names, directories, and conversation counts. |
 | `talk_bind` | Bind an exact native conversation and directory to a stable alias. |
 | `talk_models` | Read DSH's available models, their reasoning efforts, and fast-tier support. |
-| `talk_create` | Create a DSH conversation with automatic return by default; optional `model`, `effort`, and `speed` pick the model, reasoning effort, and speed (DSH also saves the model choice as its default for later conversations; the fast tier is codex-only and resets to standard when DSH restarts). |
-| `talk_send` | Send a prompt and local file paths to a DSH conversation with request-ID deduplication. Codex and Claude conversations do not message each other directly. |
-| `talk_read` | Read a DSH conversation's recent messages, progress, native state, questions, and return status. |
+| `talk_create` | Create a DSH conversation (default) or, with `app: "claude-cli"`, a Claude Code CLI worker, with automatic return by default; optional `model`, `effort`, and `speed` pick the model, reasoning effort, and speed (DSH also saves the model choice as its default for later conversations; the fast tier is codex-only and resets to standard when DSH restarts). |
+| `talk_send` | Send a prompt and local file paths to a DSH or Claude CLI conversation with request-ID deduplication. Codex and Claude conversations do not message each other directly. |
+| `talk_read` | Read a DSH or Claude CLI conversation's recent messages, progress, native state, questions, and return status. |
 | `talk_follow` | Enable or disable a DSH → initiating conversation return route. |
 | `talk_questions` | Inspect ordinary questions and permission requests. |
 | `talk_answer` | Answer ordinary questions; never grant permission approvals. |
@@ -219,7 +232,7 @@ Aliases accept 1–64 ASCII letters, digits, underscores, or hyphens. Request ID
 - Private state lives in `.local/`: SQLite coordination state, queued message bodies, question data, and DSH credentials. Treat it as sensitive. The directory is ignored by Git; credential files use mode `600` and their directory mode `700`.
 - The DSH auth adapter accepts loopback HTTP addresses only. Native IPC checks ownership and permissions. The extension does not read DSH's signing secret or change client permissions.
 - Ordinary questions can be relayed. Permission approvals remain in DSH Web. A peer message does not grant new authority.
-- Results are checked every 3 seconds; questions use a DSH event connection. Polling does not call an AI model. Receiving and processing a forwarded message can start a model turn and consume usage.
+- DSH results are checked every 3 seconds; DSH questions use a DSH event connection. Claude CLI results return when the worker process exits. Polling does not call an AI model. Receiving and processing a forwarded message can start a model turn and consume usage.
 - At least one MCP process, DSH, and the recipient must be available for return. Closing all MCP processes stops forwarding. There is no guaranteed full catch-up after a long offline period.
 - `talk_send` accepts up to 100,000 JavaScript string units, subject to a stricter **120,000-byte assembled message limit**, and at most 30 file paths. Large material should be passed by path. Return messages do not use the same size guard, but native-client and model limits still apply.
 - Reads are bounded: up to 40 recent messages; desktop transcript reads inspect the final 2 MiB. `truncated` signals omitted history. Progress is recorded tool activity, not token-by-token streaming.
@@ -246,7 +259,7 @@ npm run check
 npm run smoke
 ```
 
-The existing smoke test covers queueing, concurrent deduplication, uncertain delivery, native Stop handling, question validation, approval refusal, workspace resolution, credential renewal, and the MCP tool contract. It also verifies Chinese guidance and default return behavior with isolated mock endpoints. It is not an exhaustive compatibility test against every desktop release.
+The existing smoke test covers queueing, concurrent deduplication, uncertain delivery, native Stop handling, question validation, approval refusal, workspace resolution, credential renewal, the MCP tool contract, and the Claude CLI executor with a fake `claude` command (return, resume, `talk_ask`). It also verifies Chinese guidance and default return behavior with isolated mock endpoints. It is not an exhaustive compatibility test against every desktop release.
 
 Real local checks have exercised DSH creation/send/read, workspace selection, question/answer continuation, result return into both Codex and Claude, and credential recovery. All native Stop variants, all reconnect races, long offline catch-up, and every complete development/review workflow have not been exhaustively verified. Claude can return `held` depending on native behavior.
 
@@ -258,6 +271,8 @@ src/store.mjs            SQLite state and deduplication
 src/dsh-events.mjs       DSH questions and approval notifications
 src/dsh-auth.mjs         Private credentials and renewal
 src/dsh-auth-plugin.mjs  DSH Web credential extension
+src/claude-cli.mjs       Claude Code CLI worker processes and result return
+src/claude-ask.mjs       talk_ask MCP server injected into Claude CLI workers
 src/vendor/              Adapted native IPC code and upstream license
 scripts/                Manual connection and smoke checks
 ```

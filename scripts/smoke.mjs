@@ -10,6 +10,7 @@ import { textParts, resolveDshLocation } from '../src/adapters.mjs';
 import { Store } from '../src/store.mjs';
 import { Delivery } from '../src/delivery.mjs';
 import { DshEvents } from '../src/dsh-events.mjs';
+import { ClaudeCli } from '../src/claude-cli.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-talk-smoke-'));
@@ -194,6 +195,48 @@ try {
     assert.ok(!disabled.isError); assert.equal(JSON.parse(disabled.content[0].text).returnRoute.enabled, false);
     const oneWay = await client.callTool({ name: 'talk_create', arguments: { alias: 'one-way', cwd, requestId: crypto.randomUUID(), autoReturn: false } });
     assert.ok(!oneWay.isError); assert.equal(JSON.parse(oneWay.content[0].text).returnRoute.enabled, false); assert.equal(creations, 2);
+    // Claude CLI 执行对话只登记，不经过 DSH，也不启动进程。
+    const worker = await client.callTool({ name: 'talk_create', arguments: { alias: 'cli-worker', app: 'claude-cli', cwd, requestId: crypto.randomUUID(), replyTo: 'initiator', model: 'sonnet' } });
+    assert.ok(!worker.isError); assert.equal(JSON.parse(worker.content[0].text).app, 'claude-cli'); assert.equal(JSON.parse(worker.content[0].text).returnRoute.destination, 'initiator'); assert.equal(creations, 2);
+    const cliWorkspace = await client.callTool({ name: 'talk_create', arguments: { alias: 'cli-other', app: 'claude-cli', cwd, workspaceName: 'Project', requestId: crypto.randomUUID(), autoReturn: false } });
+    assert.equal(cliWorkspace.isError, true); assert.match(cliWorkspace.content[0].text, /仅用于 DSH/);
   } finally { await client.close(); mcpStore.close(); native.closeAllConnections(); await new Promise(r => native.close(r)); }
-  console.log('通过：忙碌排队、并发防重、不确定结果不重发、原生停止与恢复、用户介入回传、完成状态、事件连接所有权、审批拒绝、工作区匹配、凭据续期与权限、MCP 参数及中文说明、默认回传与显式关闭、held 回执展示。未发送 AI 消息。');
+
+  // Claude CLI 执行端：用假 claude 命令验证一轮执行后的自动回传、同一会话续跑，以及 talk_ask 等待 talk_answer 的回答。
+  const fakeLog = path.join(dir, 'fake-claude.log'), fakeJs = path.join(dir, 'fake-claude.mjs'), fakeBin = path.join(dir, 'fake-claude');
+  fs.writeFileSync(fakeJs, `import fs from 'node:fs';
+let input = ''; for await (const chunk of process.stdin) input += chunk;
+fs.appendFileSync(${JSON.stringify(fakeLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');
+console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'fake' }));
+console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done: ' + input.split('\\n')[1], permission_denials: [] }));
+`);
+  fs.writeFileSync(fakeBin, `#!/bin/sh\nexec "${process.execPath}" "${fakeJs}" "$@"\n`, { mode: 0o700 });
+  process.env.AGENT_TALK_CLAUDE_BIN = fakeBin;
+  const cliStore = new Store(path.join(dir, 'cli.sqlite')), workerId = crypto.randomUUID(), sent = [];
+  cliStore.bind('lead', 'codex', 'codex-lead', cwd); cliStore.bind('worker', 'claude-cli', workerId, cwd);
+  cliStore.db.prepare("INSERT INTO claude_cli(alias) VALUES('worker')").run(); cliStore.follow('worker', 'lead', '[]');
+  const cli = new ClaudeCli(cliStore);
+  const cliDelivery = new Delivery(cliStore, async t => t.app === 'claude-cli' ? cli.read(t) : { status: 'idle', messages: [] }, async (t, text, id) => t.app === 'claude-cli' ? cli.start(t, text, id) : (sent.push(text), { state: 'accepted' }));
+  cli.delivery = cliDelivery;
+  assert.equal((await cliDelivery.submit('worker', '[Agent talk message 1]\nfirst task', crypto.randomUUID())).state, 'accepted');
+  await cli.children.get('worker').done;
+  assert.equal(cli.read({ alias: 'worker' }).status, 'idle');
+  assert.equal(sent.length, 1); assert.match(sent[0], /from worker\]\n最终回复:\ndone: first task/);
+  await cliDelivery.submit('worker', '[Agent talk message 2]\nrework', crypto.randomUUID()); await cli.children.get('worker').done;
+  const runs = fs.readFileSync(fakeLog, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(runs.map(a => a[a.indexOf(workerId) - 1]), ['--session-id', '--resume']);
+  assert.ok(runs[0].includes('--dangerously-skip-permissions') && runs[0].includes('mcp__agent-talk__*'));
+  assert.match(sent[1], /done: rework/);
+  const ask = new Client({ name: 'agent-talk-smoke-ask', version: '1' });
+  try {
+    await ask.connect(new StdioClientTransport({ command: process.execPath, args: ['src/claude-ask.mjs'], env: { ...process.env, AGENT_TALK_DB: cliStore.file, AGENT_TALK_ALIAS: 'worker' }, stderr: 'pipe' }));
+    const asking = ask.callTool({ name: 'talk_ask', arguments: { question: 'A or B?', options: ['A', 'B'] } });
+    let question; while (!(question = cliStore.db.prepare("SELECT id FROM questions WHERE source='worker' AND state='pending'").get())) await new Promise(r => setTimeout(r, 50));
+    const cliEvents = new DshEvents(cliStore, cliDelivery); let dshAnswers = 0; cliEvents.result = async () => { dshAnswers++; };
+    assert.equal((await cliEvents.answer('worker', question.id, [{ id: 'q', selected: ['B'] }])).state, 'submitted');
+    assert.equal((await asking).content[0].text, 'B'); assert.equal(dshAnswers, 0);
+    assert.equal(cliStore.db.prepare("SELECT state FROM deliveries WHERE source='worker' AND body LIKE '%正在等待回答%'").get().state, 'cancelled');
+    await cliEvents.close();
+  } finally { await ask.close(); cliStore.close(); }
+  console.log('通过：忙碌排队、并发防重、不确定结果不重发、原生停止与恢复、用户介入回传、完成状态、事件连接所有权、审批拒绝、工作区匹配、凭据续期与权限、MCP 参数及中文说明、默认回传与显式关闭、held 回执展示、Claude CLI 执行端（登记、自动回传、同一会话续跑、talk_ask 问答）。未发送 AI 消息。');
 } finally { fs.rmSync(dir, { recursive: true, force: true }); }
