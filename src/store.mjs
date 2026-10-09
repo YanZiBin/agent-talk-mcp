@@ -6,13 +6,14 @@ import { createHash } from 'node:crypto';
 export class Store {
   constructor(file) {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(file); fs.chmodSync(file, 0o600);
+    this.file = path.resolve(file); this.db = new DatabaseSync(file); fs.chmodSync(file, 0o600);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA journal_size_limit=1048576;
       CREATE TABLE IF NOT EXISTS sessions(alias TEXT PRIMARY KEY, app TEXT NOT NULL, sessionId TEXT NOT NULL, cwd TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', resumeKey TEXT, UNIQUE(app,sessionId));
       CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY, destination TEXT NOT NULL, fingerprint TEXT NOT NULL, body TEXT NOT NULL, result TEXT, createdAt INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS follows(source TEXT PRIMARY KEY, destination TEXT NOT NULL, seen TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, claimUntil INTEGER NOT NULL DEFAULT 0, error TEXT);
       CREATE TABLE IF NOT EXISTS questions(id TEXT PRIMARY KEY, source TEXT NOT NULL, clientId TEXT NOT NULL, kind TEXT NOT NULL, request TEXT NOT NULL, state TEXT NOT NULL, answer TEXT);
       CREATE TABLE IF NOT EXISTS leases(name TEXT PRIMARY KEY, owner TEXT NOT NULL, expiresAt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS claude_cli(alias TEXT PRIMARY KEY, model TEXT, effort TEXT, initialized INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'idle', pid INTEGER, stopping INTEGER NOT NULL DEFAULT 0, startedAt INTEGER, endedAt INTEGER, lastResult TEXT);
     `);
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -46,7 +47,7 @@ export class Store {
     if (state === 'completed') {
       this.db.prepare('UPDATE follows SET enabled=0 WHERE source=? OR destination=?').run(alias, alias);
       this.db.prepare("UPDATE deliveries SET state='cancelled' WHERE state='queued' AND (source=? OR destination=?)").run(alias, alias);
-    } else if (state === 'paused' && old.app === 'dsh') {
+    } else if (state === 'paused' && ['dsh', 'claude-cli'].includes(old.app)) {
       // A correction after Stop must not release an old queued execution prompt.
       this.db.prepare("UPDATE deliveries SET state='cancelled' WHERE state='queued' AND destination=?").run(alias);
     }

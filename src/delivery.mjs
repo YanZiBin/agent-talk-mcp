@@ -67,7 +67,8 @@ export class Delivery {
   }
   async poll() {
     // The poll lease keeps this to one process, and event ids are deterministic, so claimUntil only marks a failure backoff.
-    for (const f of this.store.db.prepare('SELECT * FROM follows WHERE enabled=1 AND claimUntil<?').all(Date.now())) {
+    // Claude CLI routes return from process output (claude-cli.mjs), so only DSH histories are polled.
+    for (const f of this.store.db.prepare("SELECT f.* FROM follows f JOIN sessions s ON s.alias=f.source WHERE f.enabled=1 AND f.claimUntil<? AND s.app='dsh'").all(Date.now())) {
       try {
         const source = this.store.get(f.source);
         if (source.state === 'completed') continue;

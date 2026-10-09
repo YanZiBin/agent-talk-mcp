@@ -36,6 +36,7 @@ flowchart LR
 |---|---|
 | 接入已有对话 | 精确绑定原客户端会话 ID 和目录，随时可以回到原客户端继续聊。 |
 | 新建 DSH 对话 | 按名称选择已有 DSH 工作区，或指定本地目录。 |
+| 派给 Claude Code CLI | 在本地目录用后台 `claude -p` 执行任务，结果、提问和返工都在同一个 Claude 会话里。 |
 | 传递本地材料 | 发送提示词和 MD、图片、PDF 等文件的绝对路径，由接收方用自己的工具读取。 |
 | 接收结果和问题 | 新建 DSH 对话默认要求配置回传目标；普通问题可由发起对话直接回答。 |
 | 查看进度 | 读取近期消息、工具执行情况、运行状态和投递回执。 |
@@ -43,16 +44,17 @@ flowchart LR
 | 暂停与收尾 | 只暂停指定任务；审查完成后标记完成，避免继续复用。 |
 | 自动续期 DSH 凭据 | 由小型 DSH 扩展提供本地登录地址，桥接服务按需续期 Cookie。 |
 
-**当前范围：**只自动创建 DSH 对话，不创建替代的 Codex/Claude CLI 对话，不依赖浏览器点击，不自动归档。
+**当前范围：**自动创建 DSH 对话和后台 Claude Code CLI 执行对话；不创建 Codex 或 Claude Desktop 对话，不依赖浏览器点击，不自动归档。
 
 ## 环境要求与兼容性
 
-当前是通过源码安装的早期版本（`0.4.0`），面向可信的本机环境。
+当前是通过源码安装的早期版本（`0.5.0`），面向可信的本机环境。
 
 - **macOS**：目前支持的环境。Claude 原生适配器仅支持 macOS；Windows/Linux 尚未验证。
 - **Node.js 22.13 或更高版本**及 npm。本地验证使用 **22.23.2**；运行时可能出现 Node SQLite 实验性功能提示。
 - 已登录的 Codex 桌面端和/或 **Claude Desktop Code**，能够加载本地 stdio MCP。该适配器不支持普通 Claude 网页聊天。
-- 同一台电脑上正常运行的 **DSH Web**，并能访问任务所需的本地文件。
+- 使用 DSH 执行端时：同一台电脑上正常运行的 **DSH Web**，并能访问任务所需的本地文件。
+- 使用 Claude CLI 执行端时：已安装并登录的 **Claude Code CLI**。
 - 自动回传时，相关原客户端和接收对话需要保持可用。
 
 本地验证使用 **Claude Code 2.1.280**、**DSH 0.1.7-rc.1** 及当时安装的 Codex 桌面端。这是兼容性记录，并非所有版本的保证；原生 IPC 和 DSH RPC 接口可能随客户端版本变化。
@@ -178,6 +180,17 @@ args = ["/absolute/path/to/agent-talk-mcp/src/server.mjs"]
 
 > 收到其他 AI 的回复后，先结合当前对话的目标和上下文理解、判断，再以自己的视角向用户简洁汇报。默认不直接照搬原文，也不把对方的说法当作自己已经核实的事实；用户另有要求时，以用户要求为准。
 
+### Claude Code CLI 执行端
+
+`talk_create` 传 `app: "claude-cli"` 和绝对目录 `cwd`，会登记一个后台 Claude Code 执行对话（`app` 默认仍是 `dsh`）。可选 `model`、`effort` 直接传给 `claude --model/--effort`；DSH 专用的 `workspaceName`、`provider`、`speed` 会报错。调用 `talk_send` 之前不会启动任何进程：
+
+- 每条消息在 `cwd` 中启动一轮 `claude -p --output-format stream-json`，提示词经 stdin 传入。首轮使用 `--session-id <requestId>`，之后（返工）用 `--resume` 续跑同一个会话。
+- 进程退出时，最终回复（或异常结束）沿用和 DSH 相同的投递路径回传给 `replyTo` 对话。这个执行端由进程输出驱动，不增加每 3 秒的轮询。
+- **权限确认全部跳过**（`--dangerously-skip-permissions`）。Claude Code 官方文档建议只在容器或虚拟机中使用这种模式；请只在你信任执行端处理的目录里使用。
+- 中途提问：执行端会获得 `talk_ask` 工具（通过 `--mcp-config` 注入，由 `src/claude-ask.mjs` 提供），调用后一直等待，直到发起对话用 `talk_answer` 回答（答案 id 为 `q`），Claude 在同一轮内继续。执行端内禁用 `AskUserQuestion` 和用户级 `agent-talk` 的工具。
+- 每个对话同时最多一个进程；执行中收到的消息排队，本轮结束后自动发出。`talk_delivery_control` 暂停时发送 SIGINT 结束当前轮次。MCP 进程退出（例如关闭 Codex）会中断它启动的执行端。
+- 如果客户端的 `PATH` 里找不到 `claude`，在 MCP 服务的环境变量中把 `AGENT_TALK_CLAUDE_BIN` 设为绝对路径（`command -v claude` 的输出）。
+
 创建时可用 `autoReturn: false` 明确关闭回传，此时不能再传 `replyTo`。已有 DSH 对话可以先绑定，再用 `talk_follow` 建立回传；开启时只关注**新增事件**，不自动搬运全部旧历史。新默认值不会追溯修改旧对话的设置。
 
 工作区名称需精确匹配。不存在时报错，同名时需传精确 `cwd` 区分；同时传入 `workspaceName` 和 `cwd` 时目录必须一致。另行使用的开发目录或 worktree 路径写进任务提示词。不指定工作区名称时，用 `cwd` 创建未分组对话。
@@ -190,9 +203,9 @@ args = ["/absolute/path/to/agent-talk-mcp/src/server.mjs"]
 | `talk_workspaces` | 读取已有 DSH 工作区的名称、目录和对话数量。 |
 | `talk_bind` | 将精确的会话及目录绑定到固定别名。 |
 | `talk_models` | 读取 DSH 可用模型、可选思考程度，以及是否支持快速档。 |
-| `talk_create` | 创建 DSH 对话，默认开启自动回传；可选 `model`、`effort`、`speed` 指定模型、思考程度和速度（选模型会同时成为 DSH 之后的默认模型；快速档仅限 codex 模型，DSH 重启后恢复标准速度）。 |
-| `talk_send` | 向 DSH 对话发送提示词和本地文件路径，按请求 ID 防重复。Codex/Claude 对话之间不直接互发。 |
-| `talk_read` | 读取 DSH 对话的近期消息、进度、运行状态、问题和回传状态。 |
+| `talk_create` | 创建 DSH 对话（默认），或用 `app: "claude-cli"` 创建 Claude Code CLI 执行对话，默认开启自动回传；可选 `model`、`effort`、`speed` 指定模型、思考程度和速度（选模型会同时成为 DSH 之后的默认模型；快速档仅限 codex 模型，DSH 重启后恢复标准速度）。 |
+| `talk_send` | 向 DSH 或 Claude CLI 执行对话发送提示词和本地文件路径，按请求 ID 防重复。Codex/Claude 对话之间不直接互发。 |
+| `talk_read` | 读取 DSH 或 Claude CLI 执行对话的近期消息、进度、运行状态、问题和回传状态。 |
 | `talk_follow` | 开启或关闭 DSH 到发起对话的回传。 |
 | `talk_questions` | 查看普通问题和权限请求。 |
 | `talk_answer` | 回答普通问题，不代答权限审批。 |
@@ -223,7 +236,7 @@ args = ["/absolute/path/to/agent-talk-mcp/src/server.mjs"]
 - `.local/` 保存 SQLite 协作状态、排队消息正文、问题数据和 DSH 凭据，应按敏感数据保管。该目录被 Git 忽略；凭据文件权限为 `600`，目录权限为 `700`。
 - DSH 认证适配器只接受本机回环 HTTP 地址；原生 IPC 会检查所有者和权限。扩展不读取 DSH 签名密钥，不改变客户端权限。
 - 普通问题可以转交；权限审批仍在 DSH Web 处理。其他 AI 的消息不会授予新权限。
-- 每 3 秒检查新结果，普通问题通过 DSH 事件连接接收。轮询不会调用模型；回传消息被接收并处理后，可能开启新的模型轮次并消耗额度。
+- DSH 每 3 秒检查新结果，DSH 普通问题通过 DSH 事件连接接收；Claude CLI 的结果在执行进程退出时回传。轮询不会调用模型；回传消息被接收并处理后，可能开启新的模型轮次并消耗额度。
 - 自动回传需要至少一个 MCP 进程、DSH 和接收端可用。全部 MCP 关闭后停止转发，不保证长时间离线后的完整补传。
 - `talk_send` 的提示词上限为 100,000 个 JavaScript 字符串计数单位，同时整条拼接消息不得超过 **120,000 字节**，最多携带 30 个文件路径。长材料建议传文件路径。回传消息没有套用同一大小检查，但仍受原客户端和模型限制。
 - 读取最多返回近期 40 条消息，桌面对话记录只读取末尾 2 MiB；`truncated` 表示省略了更早历史。进度是已记录的工具调用情况，不是逐 token 直播。
@@ -250,7 +263,7 @@ npm run check
 npm run smoke
 ```
 
-现有冒烟测试覆盖排队、并发防重、不确定结果不重发、停止识别、问题校验、拒绝代答审批、工作区匹配、凭据续期和 MCP 工具契约，也会通过隔离模拟接口验证中文指引与默认回传。这不代表已测试所有客户端版本。
+现有冒烟测试覆盖排队、并发防重、不确定结果不重发、停止识别、问题校验、拒绝代答审批、工作区匹配、凭据续期、MCP 工具契约，以及用假 claude 命令验证的 Claude CLI 执行端（回传、续跑、talk_ask），也会通过隔离模拟接口验证中文指引与默认回传。这不代表已测试所有客户端版本。
 
 真实本机联调已走通 DSH 创建/发送/读取、工作区选择、提问后回答继续执行、回传到 Codex 和 Claude、凭据恢复。尚未穷尽验证所有原生停止形式、断线并发场景、长时间离线补传及完整开发审查流程；Claude 仍可能因原客户端行为返回 `held`。
 
@@ -262,6 +275,8 @@ src/store.mjs            SQLite 状态与防重
 src/dsh-events.mjs       DSH 提问和权限通知
 src/dsh-auth.mjs         私有凭据与续期
 src/dsh-auth-plugin.mjs  DSH Web 凭据扩展
+src/claude-cli.mjs       Claude Code CLI 执行进程与结果回传
+src/claude-ask.mjs       注入 Claude CLI 执行端的 talk_ask MCP 服务
 src/vendor/              改编的原生 IPC 代码与上游许可证
 scripts/                手动连接与冒烟检查
 ```

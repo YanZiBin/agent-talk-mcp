@@ -68,6 +68,11 @@ export class DshEvents {
     if (row.answer) { if (row.answer !== serialized) throw Error('此前已提交不同的答案'); return { state: row.state, duplicate: true }; }
     if (row.state !== 'pending') throw Error('此问题已关闭');
     if (!this.store.db.prepare("UPDATE questions SET answer=?,state='submitting' WHERE id=? AND state='pending' AND answer IS NULL").run(serialized, id).changes) throw Error('此问题已有答案正在提交');
+    if (this.store.get(source).app === 'claude-cli') {
+      // claude-ask.mjs is waiting on this row and hands the answer to Claude in the same turn.
+      this.store.db.prepare("UPDATE questions SET state='submitted' WHERE id=?").run(id); this.cancelNotice(id);
+      return { state: 'submitted', detail: '已交给 Claude CLI，它会在当前轮次内继续执行' };
+    }
     try {
       await this.result(row.clientId, id, { kind: 'result', value: { answers } });
       this.cancelNotice(id);

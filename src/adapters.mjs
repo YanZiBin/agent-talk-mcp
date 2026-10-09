@@ -163,46 +163,57 @@ export async function readSession(target, sinceCursor = null) {
     const stopped = endings.filter(e => e.data.reason?.kind === 'aborted').at(-1);
     return { status, progress, cursor: seq, pauseKey: stopped ? String(stopped.seq) : null, messages, truncated: page.hasMore, endReason: ended?.data.reason, inbox: row.projections?.values?.inbox };
   }
-  let file, status = 'unknown', pauseKey = null;
   if (target.app === 'claude') {
     const row = (await listSessions('claude')).find(s => s.sessionId === target.sessionId);
     if (!row) throw Error('此 Claude 对话未在运行（桌面端或终端）');
     if (canonical(row.cwd) !== target.cwd) throw Error('对话目录已发生变化');
-    status = row.status;
-    const root = path.join(home, '.claude/projects');
-    const matches = fs.readdirSync(root).map(p => path.join(root, p, `${target.sessionId}.jsonl`)).filter(p => fs.existsSync(p));
-    if (matches.length !== 1) throw Error('Claude 对话记录缺失，或存在多个匹配项');
-    file = matches[0];
-  } else {
-    const [row] = codexRows(target.sessionId);
-    if (!row || canonical(row.cwd) !== target.cwd) throw Error('Codex 对话目录不匹配');
-    file = row.rollout_path;
+    return { ...claudeHistory(target.sessionId), status: row.status };
   }
-  const { records, truncated } = tailRecords(file);
+  const [row] = codexRows(target.sessionId);
+  if (!row || canonical(row.cwd) !== target.cwd) throw Error('Codex 对话目录不匹配');
+  const { records, truncated } = tailRecords(row.rollout_path);
+  let status = 'unknown', pauseKey = null;
   const messages = [];
   for (const r of records) {
-    if (target.app === 'claude' && ['user', 'assistant'].includes(r.type)) {
-      const text = textParts(r.message?.content); if (text) messages.push({ id: r.uuid, role: r.type, text, final: r.message?.stop_reason === 'end_turn', time: r.timestamp });
-      if (r.type === 'user' && ['[Request interrupted by user]', '[Request interrupted by user for tool use]'].includes(text.trim())) pauseKey = r.uuid;
+    const p = r.payload;
+    if (r.type === 'event_msg') {
+      if (p.type === 'task_started') status = 'running';
+      if (p.type === 'task_complete') status = 'idle';
+      if (p.type === 'turn_aborted') { status = 'paused'; pauseKey = r.timestamp; }
+      const item = p.item;
+      if (p.type === 'item_completed' && ['UserMessage', 'AgentMessage'].includes(item?.type)) {
+        messages.push({ id: item.id, role: item.type === 'UserMessage' ? 'user' : 'assistant', text: textParts(item.content), final: item.phase === 'final_answer', time: r.timestamp });
+      }
     }
-    if (target.app === 'codex') {
-      const p = r.payload;
-      if (r.type === 'event_msg') {
-        if (p.type === 'task_started') status = 'running';
-        if (p.type === 'task_complete') status = 'idle';
-        if (p.type === 'turn_aborted') { status = 'paused'; pauseKey = r.timestamp; }
-        const item = p.item;
-        if (p.type === 'item_completed' && ['UserMessage', 'AgentMessage'].includes(item?.type)) {
-          messages.push({ id: item.id, role: item.type === 'UserMessage' ? 'user' : 'assistant', text: textParts(item.content), final: item.phase === 'final_answer', time: r.timestamp });
-        }
-      }
-      if (r.type === 'response_item' && p.type === 'message' && ['user', 'assistant'].includes(p.role)) {
-        messages.push({ id: p.id || r.timestamp, role: p.role, text: textParts(p.content), final: p.phase === 'final_answer', time: r.timestamp });
-      }
+    if (r.type === 'response_item' && p.type === 'message' && ['user', 'assistant'].includes(p.role)) {
+      messages.push({ id: p.id || r.timestamp, role: p.role, text: textParts(p.content), final: p.phase === 'final_answer', time: r.timestamp });
     }
   }
   const unique = [...new Map(messages.map(m => [m.id, m])).values()];
   return { status, pauseKey, messages: unique.slice(-40), truncated: truncated || unique.length > 40 };
+}
+
+// Claude Code transcript (Desktop Code and headless CLI sessions write the same JSONL).
+export function claudeHistory(sessionId) {
+  checkId(sessionId);
+  const root = path.join(home, '.claude/projects');
+  const matches = fs.readdirSync(root).map(p => path.join(root, p, `${sessionId}.jsonl`)).filter(p => fs.existsSync(p));
+  if (matches.length !== 1) throw Error('Claude 对话记录缺失，或存在多个匹配项');
+  const { records, truncated } = tailRecords(matches[0]);
+  let pauseKey = null;
+  const messages = [], calls = [], results = new Map();
+  for (const r of records) {
+    if (!['user', 'assistant'].includes(r.type)) continue;
+    const text = textParts(r.message?.content); if (text) messages.push({ id: r.uuid, role: r.type, text, final: r.message?.stop_reason === 'end_turn', time: r.timestamp });
+    if (r.type === 'user' && ['[Request interrupted by user]', '[Request interrupted by user for tool use]'].includes(text.trim())) pauseKey = r.uuid;
+    for (const part of Array.isArray(r.message?.content) ? r.message.content : []) {
+      if (part.type === 'tool_use') calls.push({ id: part.id, tool: part.name, time: r.timestamp });
+      if (part.type === 'tool_result') results.set(part.tool_use_id, part.is_error);
+    }
+  }
+  const progress = calls.slice(-10).map(c => ({ ...c, state: results.has(c.id) ? (results.get(c.id) ? 'failed' : 'finished') : 'unfinished' }));
+  const unique = [...new Map(messages.map(m => [m.id, m])).values()];
+  return { pauseKey, progress, messages: unique.slice(-40), truncated: truncated || unique.length > 40 };
 }
 
 export async function sendNative(target, text, requestId) {
