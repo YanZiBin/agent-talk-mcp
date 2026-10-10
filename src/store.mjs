@@ -13,11 +13,12 @@ export class Store {
       CREATE TABLE IF NOT EXISTS follows(source TEXT PRIMARY KEY, destination TEXT NOT NULL, seen TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, claimUntil INTEGER NOT NULL DEFAULT 0, error TEXT);
       CREATE TABLE IF NOT EXISTS questions(id TEXT PRIMARY KEY, source TEXT NOT NULL, clientId TEXT NOT NULL, kind TEXT NOT NULL, request TEXT NOT NULL, state TEXT NOT NULL, answer TEXT);
       CREATE TABLE IF NOT EXISTS leases(name TEXT PRIMARY KEY, owner TEXT NOT NULL, expiresAt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS creations(id TEXT PRIMARY KEY, alias TEXT UNIQUE NOT NULL, app TEXT NOT NULL, cwd TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL, sessionId TEXT, error TEXT);
     `);
     this.db.exec('BEGIN IMMEDIATE');
     try {
     const cols = new Set(this.db.prepare('PRAGMA table_info(deliveries)').all().map(c => c.name));
-    for (const [name, type] of [['state', "TEXT NOT NULL DEFAULT 'unknown'"], ['source', 'TEXT'], ['nextAt', 'INTEGER NOT NULL DEFAULT 0']]) {
+    for (const [name, type] of [['state', "TEXT NOT NULL DEFAULT 'unknown'"], ['source', 'TEXT'], ['nextAt', 'INTEGER NOT NULL DEFAULT 0'], ['sender', 'TEXT']]) {
       if (!cols.has(name)) this.db.exec(`ALTER TABLE deliveries ADD COLUMN ${name} ${type}`);
     }
     if (!cols.has('state')) this.db.exec("UPDATE deliveries SET state=COALESCE(json_extract(result,'$.state'),'unknown')");
@@ -52,18 +53,18 @@ export class Store {
     }
     return this.get(alias);
   }
-  reserve(id, destination, body, source = null) {
+  reserve(id, destination, body, source = null, sender = null) {
     const fingerprint = createHash('sha256').update(JSON.stringify([destination, body])).digest('hex');
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const old = this.delivery(id);
       if (old) {
-        if (old.fingerprint !== fingerprint || old.source !== source) throw Error('此请求 ID 已绑定不同内容');
+        if (old.fingerprint !== fingerprint || old.source !== source || old.sender !== sender) throw Error('此请求 ID 已绑定不同内容');
         this.db.exec('COMMIT'); return { duplicate: true, result: this.result(old) };
       }
       const target = this.get(destination);
       if (target.state === 'completed' || (!source && target.state !== 'active')) throw Error('此对话的投递已暂停或完成');
-      this.db.prepare("INSERT INTO deliveries(id,destination,fingerprint,body,createdAt,state,source) VALUES(?,?,?,?,?,'queued',?)").run(id, destination, fingerprint, body, Date.now(), source);
+      this.db.prepare("INSERT INTO deliveries(id,destination,fingerprint,body,createdAt,state,source,sender) VALUES(?,?,?,?,?,'queued',?,?)").run(id, destination, fingerprint, body, Date.now(), source, sender);
       this.db.exec('COMMIT'); return { duplicate: false };
     } catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
@@ -80,14 +81,15 @@ export class Store {
   follow(source, destination, seen, cursor = null) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const edges = new Map(this.db.prepare('SELECT source,destination FROM follows WHERE enabled=1').all().map(r => [r.source, r.destination]));
+      const edges = new Map(this.db.prepare('SELECT source,destination FROM follows WHERE enabled>0').all().map(r => [r.source, r.destination]));
       edges.set(source, destination);
       const visited = new Set(); let next = source;
       while (edges.has(next)) {
         if (visited.has(next)) throw Error('此自动回传设置会形成消息循环');
         visited.add(next); next = edges.get(next);
       }
-      this.db.prepare('INSERT INTO follows(source,destination,seen,cursor,enabled) VALUES(?,?,?,?,1) ON CONFLICT(source) DO UPDATE SET destination=excluded.destination,seen=excluded.seen,cursor=excluded.cursor,enabled=1,failures=0,error=NULL,claimUntil=0').run(source, destination, seen, cursor);
+      const enabled = this.get(source).app === 'dsh' ? 1 : 2;
+      this.db.prepare('INSERT INTO follows(source,destination,seen,cursor,enabled) VALUES(?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET destination=excluded.destination,seen=excluded.seen,cursor=excluded.cursor,enabled=excluded.enabled,failures=0,error=NULL,claimUntil=0').run(source, destination, seen, cursor, enabled);
       this.db.exec('COMMIT');
     } catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }

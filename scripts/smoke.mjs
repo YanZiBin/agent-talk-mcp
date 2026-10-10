@@ -1,22 +1,56 @@
 import http from 'node:http';
+import net from 'node:net';
 import { once } from 'node:events';
 import { ensureDshAuth, readPrivate, writePrivate, cookieExpiry } from '../src/dsh-auth.mjs';
-import { dshCall } from '../src/adapters.mjs';
+import { dshCall, createSession } from '../src/adapters.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { textParts, resolveDshLocation } from '../src/adapters.mjs';
+import { textParts, resolveDshLocation, peerText, codexUserText } from '../src/adapters.mjs';
 import { Store } from '../src/store.mjs';
 import { Delivery } from '../src/delivery.mjs';
 import { DshEvents } from '../src/dsh-events.mjs';
+import { desktopTool, desktopRelay, serveDesktopRelay } from '../src/vendor/local-ipc.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-talk-smoke-'));
 try {
   assert.equal(textParts([{type:'reasoning',text:'internal'}, {type:'text',text:'visible reply'}, {type:'tool_use',text:'not a reply'}]), 'visible reply');
   assert.equal(textParts([{type:'input_text',text:'user'}, {type:'output_text',text:'assistant'}]), 'user\nassistant');
+  assert.equal(codexUserText({ content: [{type:'input_text',text:'private project instructions'}, {type:'input_text',text:'runtime context'}], internal_chat_message_metadata_passthrough: {content_item_kinds:['agents_md.instructions','environments.environment_context']} }),'');
+  assert.equal(codexUserText({ content: [{type:'input_text',text:'project instructions'}, {type:'input_text',text:'human follow-up'}], internal_chat_message_metadata_passthrough: {content_item_kinds:['agents_md.instructions','user_input.text']} }),'human follow-up');
   const cwd = fs.realpathSync(dir), otherDir = path.join(cwd, 'other'); fs.mkdirSync(otherDir);
+  await assert.rejects(createSession('codex', cwd, crypto.randomUUID()), e => e.notSubmitted === true);
+  // Exercise the real framed Desktop client, including fragmented responses and uncertain disconnects.
+  const socketPath = path.join(dir, 'desktop.sock'); let desktopRequests = 0;
+  const desktop = net.createServer(socket => {
+    let incoming = Buffer.alloc(0);
+    socket.on('data', chunk => {
+      incoming = Buffer.concat([incoming, chunk]);
+      if (incoming.length < 4 || incoming.length < incoming.readUInt32LE(0) + 4) return;
+      const request = JSON.parse(incoming.subarray(4)); desktopRequests++;
+      if (request.params.arguments.disconnect) { socket.destroy(); return; }
+      const payload = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify({ projects: [{ path: cwd }] }) }] } }));
+      const header = Buffer.alloc(4); header.writeUInt32LE(payload.length);
+      socket.write(header.subarray(0,2)); socket.write(Buffer.concat([header.subarray(2),payload]));
+    });
+  });
+  desktop.listen(socketPath); await once(desktop, 'listening'); fs.chmodSync(socketPath, 0o600);
+  try {
+    assert.equal((await desktopTool({ pipe: socketPath, threadId: 'real-thread', tool: 'list_projects', args: {} })).projects[0].path, cwd);
+    await assert.rejects(desktopTool({ pipe: socketPath, threadId: 'real-thread', tool: 'list_projects', args: {disconnect:true} }), e => e.uncertain === true);
+    assert.equal(desktopRequests, 2);
+  } finally { await new Promise(r => desktop.close(r)); }
+  const relaySocket = path.join(dir,'relay.sock'); let relayed = 0;
+  const closeRelay = await serveDesktopRelay(relaySocket, async request => { relayed++; return {threadId:request.threadId}; });
+  try {
+    assert.equal((await desktopRelay(relaySocket,{threadId:'bound-codex',tool:'list_projects',args:{}})).threadId,'bound-codex');
+    await assert.rejects(desktopRelay(relaySocket,{threadId:'bound-codex',tool:'send_message_to_thread',args:{}}),/不支持/);
+    assert.equal(relayed,1);
+  } finally { await closeRelay(); }
+  const wrapped = 'Another Claude session sent a message:\n<cross-session-message from="uds:/tmp/peer.sock" from-mode="bypass">\nexact body\n</cross-session-message>\n\nThis came from another Claude session';
+  assert.equal(peerText(wrapped),'exact body'); assert.equal(peerText('ordinary user text'),'ordinary user text');
   const workspaces = [{ workspaceId: 'w1', title: 'Project', path: cwd, sessionIds: [] }];
   assert.equal(resolveDshLocation(undefined, 'Project', workspaces).workspace.workspaceId, 'w1');
   assert.equal(resolveDshLocation(cwd, undefined).cwd, cwd);
@@ -120,6 +154,30 @@ try {
   await new Delivery(store, async (t, cursor) => { since = cursor; return { unchanged: true, cursor }; }, transmit).poll();
   assert.equal(since, 7); assert.deepEqual(store.db.prepare("SELECT * FROM follows WHERE source='steady'").get(), route);
   store.control('steady', 'completed');
+  // Direct DSH messages with no source/sender must survive the legacy queue filter.
+  store.bind('legacy-queue', 'dsh', 'legacy-native', dir);
+  pauseKey = null;
+  status = 'running'; await delivery.submit('legacy-queue', 'queued legacy task', 'legacy-queued');
+  store.db.prepare("UPDATE deliveries SET nextAt=0 WHERE id='legacy-queued'").run();
+  status = 'idle'; await delivery.poll(false);
+  assert.equal(store.delivery('legacy-queued').state, 'accepted');
+  // A desktop final is returned once; incoming bridge messages never echo back as user intervention.
+  store.bind('desktop-peer', 'codex', 'desktop-native', dir);
+  store.follow('desktop-peer', 'planner', '[]');
+  assert.equal(peer.db.prepare("SELECT enabled FROM follows WHERE source='desktop-peer'").get().enabled, 2);
+  store.control('planner','active');
+  let actualSender;
+  const desktopDelivery = new Delivery(store, async () => ({ status: 'idle', messages: [
+    { id: 'echo', role: 'user', text: 'Another Claude session sent a message:\n[Agent talk message test]\nquestion' },
+    { id: 'answer', role: 'assistant', final: true, text: 'Native desktop answer' },
+  ] }), async (target, body, id, sender) => { actualSender = sender?.alias; return { state: 'accepted' }; });
+  await desktopDelivery.poll(true); await desktopDelivery.poll(true);
+  assert.equal(store.db.prepare("SELECT COUNT(*) count FROM deliveries WHERE source='desktop-peer'").get().count,1);
+  assert.equal(actualSender,'desktop-peer');
+  assert.throws(() => store.follow('planner','desktop-peer','[]'), /消息循环/);
+  const sent = await desktopDelivery.submit('desktop-peer','follow-up','desktop-direct',null,'planner');
+  assert.equal(sent.state,'accepted'); assert.equal(actualSender,'planner');
+  await assert.rejects(desktopDelivery.submit('desktop-peer','follow-up','desktop-direct',null,'desktop-peer'), /不同内容/);
   assert.equal(store.lease('events', 'one'), true); assert.equal(peer.lease('events', 'two'), false);
   // Permission requests cannot be converted to approvals through the ordinary answer tool.
   const events = new DshEvents(store, delivery);
@@ -169,7 +227,7 @@ try {
     assert.equal(tools.find(t => t.name === 'talk_create').inputSchema.properties.autoReturn.default, true);
     const r = await client.callTool({ name: 'talk_create', arguments: { alias: 'not-created', app: 'claude', cwd: process.cwd(), requestId: crypto.randomUUID() } });
     assert.equal(r.isError, true);
-    assert.match(r.content[0].text, /参数校验失败/);
+    assert.match(r.content[0].text, /默认开启自动回传/);
     const missing = await client.callTool({ name: 'talk_read', arguments: { alias: 'missing' } });
     assert.equal(missing.isError, true); assert.match(missing.content[0].text, /未知的对话别名/);
     const out = await client.callTool({ name: 'talk_outbox', arguments: {} }); assert.equal(JSON.parse(out.content[0].text).deliveries.length, 0);

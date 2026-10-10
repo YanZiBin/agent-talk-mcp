@@ -10,7 +10,7 @@
 ![Node.js](https://img.shields.io/badge/Node.js-22.13%2B-43853d)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-在已有的 **Codex 桌面对话 / Claude Desktop Code 对话** 与 **DSH Web** 之间传递任务、问题和结果的轻量本地 MCP 服务。
+在 **Codex 桌面对话与 Claude Desktop Code 对话** 之间新建桌面对话、传递任务、持续问答和回传结果的本地 MCP 服务。已有 DSH 协作保持兼容。
 
 </div>
 
@@ -43,11 +43,11 @@ flowchart LR
 | 暂停与收尾 | 只暂停指定任务；审查完成后标记完成，避免继续复用。 |
 | 自动续期 DSH 凭据 | 由小型 DSH 扩展提供本地登录地址，桥接服务按需续期 Cookie。 |
 
-**当前范围：**只自动创建 DSH 对话，不创建替代的 Codex/Claude CLI 对话，不依赖浏览器点击，不自动归档。
+**桌面范围：**新建 Codex/Claude 原生桌面对话，向精确绑定的目标发送任务与回答。Codex 使用原客户端工具管道；Claude 在 macOS 上通过辅助功能操作已信任项目的新建按钮。创建时只发送初始化消息，随后用 `talk_send` 派任务；不自动归档。
 
 ## 环境要求与兼容性
 
-当前是通过源码安装的早期版本（`0.4.0`），面向可信的本机环境。
+当前是通过源码安装的早期版本（`0.5.0`），面向可信的本机环境。
 
 - **macOS**：目前支持的环境。Claude 原生适配器仅支持 macOS；Windows/Linux 尚未验证。
 - **Node.js 22.13 或更高版本**及 npm。本地验证使用 **22.23.2**；运行时可能出现 Node SQLite 实验性功能提示。
@@ -55,7 +55,26 @@ flowchart LR
 - 同一台电脑上正常运行的 **DSH Web**，并能访问任务所需的本地文件。
 - 自动回传时，相关原客户端和接收对话需要保持可用。
 
-本地验证使用 **Claude Code 2.1.280**、**DSH 0.1.7-rc.1** 及当时安装的 Codex 桌面端。这是兼容性记录，并非所有版本的保证；原生 IPC 和 DSH RPC 接口可能随客户端版本变化。
+此前 DSH 联调使用 **Claude Code 2.1.280**、**DSH 0.1.7-rc.1** 及当时安装的 Codex 桌面端。2026-10-10 的双向桌面联调使用 Claude Code **2.1.295**；详见[本机验证记录](docs/desktop-verification.md)。这是兼容性记录，并非所有版本的保证；原生 IPC 和 DSH RPC 接口可能随客户端版本变化。
+
+## Codex 与 Claude 桌面协作
+
+在两个客户端为 Agent Talk 使用 Codex 桌面端随附的签名 Node。macOS 示例位置为 `/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node`，其他安装位置以实际应用为准。普通 Node 会被新版 Codex 桌面工具管道拒绝。Codex MCP 配置还需转发动态环境变量，保留原命令和参数：
+
+```toml
+env_vars = ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_THREAD_ID"]
+```
+
+先从 Codex 桌面对话连接 Agent Talk，让已连接的 Codex MCP 进程提供本机私有转接接口；Claude MCP 使用同一源码目录和 SQLite 状态。源码或配置更新后重连客户端 MCP。
+
+1. 用 `talk_list` 和 `talk_bind` 绑定自己的精确会话，得到发起方别名。
+2. 用 `talk_create` 指定 `app: "claude"` 或 `"codex"`、目标 `cwd`、新别名、稳定 UUID `requestId` 和 `replyTo`。桌面对话的原生 ID 由客户端分配，创建回执会保存这个 ID。
+3. 用 `talk_send` 指定目标 `destination`、自己的 `sender`、任务 `prompt` 和新的 UUID。澄清、回答及返工都继续发送到同一个目标。
+4. 目标的新增最终回复自动回到 `replyTo`。普通问题可在最终回复中提出，发起方再用 `talk_send` 回答。权限审批仍在原客户端处理。
+
+Claude 目标项目须已有正在运行的 Code 对话，并在侧栏可见；新建会暂时切换 Claude 的界面。多个同名项目、未信任目录、未发送输入或目录不符会阻止操作。Claude 标题由原客户端产生，`title` 仅用于 Codex/DSH。
+
+创建请求落盘后，结果不确定时只读回原会话，不再次新建。只有已确认尚未调用 Send 的失败，才允许用原请求恢复草稿。`held` 表示原客户端暂存，不自动修改接收权限，也不更换接收方。新建对话的初始指引明确禁止按项目名猜测其他聊天或使用原生 `ListAgents` / `SendMessage` 改换目标。
 
 ## 快速开始
 
@@ -190,9 +209,9 @@ args = ["/absolute/path/to/agent-talk-mcp/src/server.mjs"]
 | `talk_workspaces` | 读取已有 DSH 工作区的名称、目录和对话数量。 |
 | `talk_bind` | 将精确的会话及目录绑定到固定别名。 |
 | `talk_models` | 读取 DSH 可用模型、可选思考程度，以及是否支持快速档。 |
-| `talk_create` | 创建 DSH 对话，默认开启自动回传；可选 `model`、`effort`、`speed` 指定模型、思考程度和速度（选模型会同时成为 DSH 之后的默认模型；快速档仅限 codex 模型，DSH 重启后恢复标准速度）。 |
-| `talk_send` | 向 DSH 对话发送提示词和本地文件路径，按请求 ID 防重复。Codex/Claude 对话之间不直接互发。 |
-| `talk_read` | 读取 DSH 对话的近期消息、进度、运行状态、问题和回传状态。 |
+| `talk_create` | 创建 Codex/Claude 原生桌面对话，或兼容创建 DSH 对话，默认开启自动回传；DSH 可选 `model`、`effort`、`speed` 指定模型、思考程度和速度（选模型会同时成为 DSH 之后的默认模型；快速档仅限 codex 模型，DSH 重启后恢复标准速度）。 |
+| `talk_send` | 向 DSH 对话发送提示词和本地文件路径，按请求 ID 防重复。桌面发送需提供 `sender`，指向实际发起对话的别名。 |
+| `talk_read` | 读取 Codex、Claude 或 DSH 对话的近期消息、运行状态和回传状态。 |
 | `talk_follow` | 开启或关闭 DSH 到发起对话的回传。 |
 | `talk_questions` | 查看普通问题和权限请求。 |
 | `talk_answer` | 回答普通问题，不代答权限审批。 |
@@ -228,7 +247,7 @@ args = ["/absolute/path/to/agent-talk-mcp/src/server.mjs"]
 - `talk_send` 的提示词上限为 100,000 个 JavaScript 字符串计数单位，同时整条拼接消息不得超过 **120,000 字节**，最多携带 30 个文件路径。长材料建议传文件路径。回传消息没有套用同一大小检查，但仍受原客户端和模型限制。
 - 读取最多返回近期 40 条消息，桌面对话记录只读取末尾 2 MiB；`truncated` 表示省略了更早历史。进度是已记录的工具调用情况，不是逐 token 直播。
 - 目前支持一个本机 DSH Web 实例；文件按绝对路径共享，不提供跨机器上传或同步。
-- 不自动归档，不自动新建桌面对话，不绕过审批，不内置 Git、worktree 或 PR 流程。
+- 不自动归档，不绕过审批，不内置 Git、worktree 或 PR 流程。桌面新建须显式指定 `app` 和已经保存、已经信任的 `cwd`；不自动信任工作区，不修改权限模式，也不会覆盖 Claude 中尚未发送的输入。
 
 ## 常见问题
 

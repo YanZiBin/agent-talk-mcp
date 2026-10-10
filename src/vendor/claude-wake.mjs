@@ -232,12 +232,13 @@ export class ClaudeWake {
                         type: "user",
                         msgV: 1,
                         msg_id: id,
+                        uuid: id,
                         session_id: session.sessionId,
                         from: "uds:" + callback,
                         priority: "next",
                         message: {
                             role: "user",
-                            content: wakeNotice(job)
+                            content: `<cross-session-message from="uds:${callback}"${["bypass", "prompting"].includes(job.permissionClass) ? ` from-mode="${job.permissionClass}"` : ""}>\n${wakeNotice(job)}\n</cross-session-message>`
                         }
                     }) + "\n", ok);
                 });

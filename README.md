@@ -43,11 +43,11 @@ flowchart LR
 | Pause and finish | Pause one task without pausing the others; mark reviewed work complete to prevent reuse. |
 | Renew DSH credentials | A small DSH extension supplies the local login URL; the bridge renews its cookie when needed. |
 
-**Scope:** this version automatically creates DSH conversations only. It does not create replacement Codex/Claude CLI sessions, automate browser clicks, or archive conversations.
+**Scope:** create native Codex/Claude Desktop conversations and send tasks and follow-up answers. Existing DSH workflows remain compatible; no replacement CLI sessions or automatic archiving.
 
 ## Requirements and compatibility
 
-This is an early, source-installed release (`0.4.0`), intended for a trusted local machine.
+This is an early, source-installed release (`0.5.0`), intended for a trusted local machine.
 
 - **macOS** is the currently supported environment. The Claude native adapter is macOS-only; Windows/Linux support has not been validated.
 - **Node.js 22.13 or later** and npm. Node.js **22.23.2** was used for local verification. Node's SQLite experimental warning may appear.
@@ -55,7 +55,17 @@ This is an early, source-installed release (`0.4.0`), intended for a trusted loc
 - A working **DSH Web** installation on the same machine, with access to the same local files.
 - The native apps and the receiving conversation must remain available for automatic return.
 
-Local verification used **Claude Code 2.1.280** and **DSH 0.1.7-rc.1**, plus the installed Codex Desktop. These are compatibility observations, not a guarantee for every release. Native IPC and DSH RPC interfaces can change independently of MCP.
+Earlier DSH verification used **Claude Code 2.1.280** and **DSH 0.1.7-rc.1**, plus the installed Codex Desktop. Bidirectional desktop verification on 2026-10-10 used Claude Code **2.1.295**; see the [sanitized local verification record](docs/desktop-verification.md). These are compatibility observations, not a guarantee for every release. Native IPC and DSH RPC interfaces can change independently of MCP.
+
+## Codex and Claude Desktop conversations
+
+Version 0.5 supports creating native Codex and Claude Desktop Code conversations, sending tasks and follow-up answers to an exact bound conversation, and returning final replies. Existing DSH routes remain compatible.
+
+Use Codex Desktop's signed bundled Node runtime for Agent Talk in both clients (for example `/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node`). Forward `CODEX_APP_TOOLS_PIPE_PATH` and `CODEX_THREAD_ID` through the Codex MCP entry's `env_vars`, then connect Agent Talk from Codex once to provide the private Desktop relay. Reconnect affected MCP clients after an update.
+
+Bind your own session with `talk_list` / `talk_bind`. Create the counterpart with explicit `app: "codex"` or `"claude"`, an existing trusted project `cwd`, a fresh stable UUID `requestId`, and your alias in `replyTo`. Creation sends only a ready handshake. Send work with `talk_send`, supplying your alias as `sender`; continue questions and answers in the same destination. `talk_read` supports all three clients.
+
+Claude creation currently requires macOS Accessibility/Automation access, an already-running Code session in the target project, and a visible sidebar project. It never trusts a directory, changes permission mode, overwrites an unsent draft, or guesses another recipient. `title` applies to Codex/DSH; Claude names its own task. A creation with an uncertain outcome is only observed, never replayed. A confirmed pre-Send failure may recover its original draft. Desktop return routes have a separate polling lease so older DSH clients can remain connected during an upgrade.
 
 ## Quick start
 
@@ -186,7 +196,7 @@ Workspace names must match exactly. Missing names produce an error; duplicate na
 | `talk_workspaces` | Read existing DSH workspace names, directories, and conversation counts. |
 | `talk_bind` | Bind an exact native conversation and directory to a stable alias. |
 | `talk_models` | Read DSH's available models, their reasoning efforts, and fast-tier support. |
-| `talk_create` | Create a DSH conversation with automatic return by default; optional `model`, `effort`, and `speed` pick the model, reasoning effort, and speed (DSH also saves the model choice as its default for later conversations; the fast tier is codex-only and resets to standard when DSH restarts). |
+| `talk_create` | Create a native Codex/Claude Desktop conversation, or a DSH conversation, with automatic return by default; DSH-only optional `model`, `effort`, and `speed` pick the model, reasoning effort, and speed (DSH also saves the model choice as its default for later conversations; the fast tier is codex-only and resets to standard when DSH restarts). |
 | `talk_send` | Send a prompt and local file paths to a DSH conversation with request-ID deduplication. Codex and Claude conversations do not message each other directly. |
 | `talk_read` | Read a DSH conversation's recent messages, progress, native state, questions, and return status. |
 | `talk_follow` | Enable or disable a DSH → initiating conversation return route. |

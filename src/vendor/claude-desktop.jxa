@@ -1,0 +1,46 @@
+// Adapted from WarrenJones/desktop-agent-bridge's macOS adapter (MIT), see THIRD_PARTY.md.
+function value(element, key) { try { return String(element[key]()); } catch (_) { return ""; } }
+function press(element) {
+  var actions = element.actions();
+  for (var i = 0; i < actions.length; i++) if (value(actions[i], "name") === "AXPress") { actions[i].perform(); return; }
+  throw Error("Claude 控件无法操作");
+}
+function find(window, role, label) {
+  var elements = window.entireContents(), matches = [];
+  for (var i = 0; i < elements.length; i++) if (value(elements[i], "role") === role && (value(elements[i], "name") === label || value(elements[i], "description") === label)) matches.push(elements[i]);
+  if (matches.length > 1) throw Error("Claude 控件匹配不唯一：" + label);
+  return matches[0];
+}
+function waitFor(fn) {
+  var deadline = Date.now() + 10000;
+  while (Date.now() < deadline) { var result = fn(); if (result) return result; delay(0.25); }
+  throw Error("等待 Claude 桌面控件超时；请检查当前界面");
+}
+function run(argv) {
+  var cwd = argv[0], prompt = argv[1], project = cwd.split("/").pop();
+  if (!cwd || !prompt || !prompt.startsWith("[Agent talk create ")) throw Error("新建请求无效");
+  console.log("preflight");
+  var claude = Application("System Events").applicationProcesses.byName("Claude");
+  if (!claude.exists()) throw Error("Claude Desktop 未运行");
+  var windows = claude.windows(), window;
+  for (var j = 0; j < windows.length; j++) if (value(windows[j], "subrole") === "AXStandardWindow") { if (window) throw Error("Claude 有多个窗口，请保留一个目标窗口"); window = windows[j]; }
+  if (!window) throw Error("Claude Desktop 没有可用窗口");
+  var input = find(window, "AXTextArea", "Prompt");
+  var ownDraft = input && value(input, "value") === prompt;
+  if (input && value(input, "value").trim() && !ownDraft) throw Error("Claude 当前有未发送的输入；尚未发送，未覆盖输入");
+  if (!ownDraft) {
+    var button = find(window, "AXButton", "New session in " + project);
+    if (!button) throw Error("请先在 Claude Code 侧栏打开目标项目：" + project);
+    console.log("selecting");
+    press(button);
+  }
+  input = waitFor(function () { return find(window, "AXTextArea", "Prompt"); });
+  var selector = find(window, "AXPopUpButton", project);
+  if (!selector || (value(input, "value").trim() && !ownDraft)) throw Error("Claude 新建目录或输入状态不匹配；尚未发送");
+  input.value = prompt;
+  waitFor(function () { return value(input, "value") === prompt; });
+  var send = waitFor(function () { var b = find(window, "AXButton", "Send"); return b && value(b, "enabled") === "true" ? b : null; });
+  console.log("sending");
+  press(send);
+  return "submitted";
+}
