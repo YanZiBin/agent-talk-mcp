@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readSession, sendNative } from './adapters.mjs';
 
-export const eligible = m => m.final || m.role === 'user' || m.event;
+export const eligible = m => m.final || (m.role === 'user' && !m.peer) || m.event;
 export const eventKey = m => `${m.id}:${m.final ? 'final' : m.role}`;
 export function eventId(...parts) {
   const h = createHash('sha256').update(JSON.stringify(parts)).digest('hex');
@@ -18,8 +18,8 @@ export class Delivery {
     }
     return target;
   }
-  async submit(destination, body, id, source = null) {
-    const old = this.store.reserve(id, destination, body, source);
+  async submit(destination, body, id, source = null, sender = null) {
+    const old = this.store.reserve(id, destination, body, source, sender);
     if (!old.duplicate) await this.deliver(id);
     return { ...this.store.result(this.store.delivery(id)), duplicate: old.duplicate };
   }
@@ -59,15 +59,17 @@ export class Delivery {
     }
     if (!this.store.claim(id)) return;
     try {
-      const result = await this.transmit(target, row.body, id);
+      const sender = row.sender || row.source;
+      const result = await this.transmit(target, row.body, id, sender ? this.store.get(sender) : undefined);
       // These native results prove no write was admitted. Unknown/held/refused never replay.
       if (['busy', 'unavailable', 'pending'].includes(result.state)) this.store.receipt(id, { ...result, state: 'queued' }, 5000);
       else this.store.receipt(id, result);
     } catch { this.store.receipt(id, { state: 'unknown', detail: '原客户端写入结果不确定，请检查原对话，不会重发' }); }
   }
-  async poll() {
+  async poll(desktopOnly = null) {
     // The poll lease keeps this to one process, and event ids are deterministic, so claimUntil only marks a failure backoff.
-    for (const f of this.store.db.prepare('SELECT * FROM follows WHERE enabled=1 AND claimUntil<?').all(Date.now())) {
+    const routeFilter = desktopOnly === null ? 'enabled>0' : desktopOnly ? 'enabled=2' : 'enabled=1';
+    for (const f of this.store.db.prepare(`SELECT * FROM follows WHERE ${routeFilter} AND claimUntil<?`).all(Date.now())) {
       try {
         const source = this.store.get(f.source);
         if (source.state === 'completed') continue;
@@ -79,7 +81,7 @@ export class Delivery {
           this.observe(this.store.get(f.source), snapshot);
           const old = new Set(JSON.parse(f.seen));
           for (const m of snapshot.messages || []) {
-            if (!eligible(m) || old.has(eventKey(m)) || m.text.startsWith('[Agent talk ')) continue;
+            if (m.text.trim() === 'AGENT_TALK_READY' || !eligible(m) || old.has(eventKey(m)) || (m.role === 'user' && m.text.includes('[Agent talk '))) continue;
             this.enqueueEvent(f.source, f.destination, eventKey(m), `${m.role === 'user' ? '用户介入' : m.event ? '运行事件' : '最终回复'}:\n${m.text}`);
           }
           seen = JSON.stringify((snapshot.messages || []).filter(eligible).map(eventKey)); cursor = snapshot.cursor ?? null;
@@ -96,7 +98,8 @@ export class Delivery {
     }
     // A destination that is busy for one queued message is busy for the rest of this round too.
     const waiting = new Set();
-    for (const row of this.store.db.prepare("SELECT id,destination FROM deliveries WHERE state='queued' AND nextAt<=? ORDER BY createdAt LIMIT 20").all(Date.now())) {
+    const queueFilter = desktopOnly === null ? '' : ` AND ${desktopOnly ? '' : 'NOT '}(sender IS NOT NULL OR (source IS NOT NULL AND source IN (SELECT alias FROM sessions WHERE app!='dsh')))`;
+    for (const row of this.store.db.prepare(`SELECT id,destination FROM deliveries WHERE state='queued' AND nextAt<=?${queueFilter} ORDER BY createdAt LIMIT 20`).all(Date.now())) {
       if (!waiting.has(row.destination) && await this.deliver(row.id) === 'wait') waiting.add(row.destination);
     }
     // Uncertain writes are only checked for a day; after that they stay as-is and are never resent.
